@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """GhostAP controller (v0.2).
 
-At boot: give NetworkManager `boot_timeout` seconds to join a known WiFi.
+At boot: for up to `boot_timeout` seconds, rescan and ask NetworkManager to join a known WiFi.
 If it doesn't, bring up a fallback access point (hostapd + dnsmasq).
 Runs once and exits. Nothing scans or polls afterward.
 
@@ -145,7 +145,7 @@ def load_config(path: Path) -> Config:
         net, ap, dhcp = raw["network"], raw["access_point"], raw["dhcp"]
         cfg = Config(
             interface=net.get("interface", "wlan0"),
-            boot_timeout=int(net.get("boot_timeout", 45)),
+            boot_timeout=int(net.get("boot_timeout", 60)),
             ssid=ap["ssid"],
             passphrase=_read_secret(Path(ap["passphrase_file"])),
             country=ap.get("country", "US"),
@@ -321,17 +321,69 @@ def current_connection(sh: Shell, iface: str) -> str | None:
     return name if name and name != "--" else None
 
 
+NUDGE_EVERY = 10      # seconds between "look for the network and join it" attempts
+SCAN_SETTLE = 4       # a rescan on the Pi Zero W takes a few seconds
+
+
+def wifi_state(sh: Shell, iface: str) -> str:
+    """NetworkManager's state word for the interface: connected, connecting,
+    disconnected, unavailable, unmanaged ... or "" if it isn't listed (yet)."""
+    r = sh.run("nmcli", "-t", "-f", "DEVICE,TYPE,STATE", "device", check=False)
+    for line in r.stdout.splitlines():
+        parts = line.split(":", 2)
+        if len(parts) == 3 and parts[0] == iface and parts[1] == "wifi":
+            return parts[2]
+    return ""
+
+
+def _look_and_join(sh: Shell, cfg: Config) -> None:
+    """Don't wait for NetworkManager's own autoconnect, which on a Pi Zero W can
+    take a minute or more to get going. Rescan, then ask it to join a known
+    network that is in range (rolling back to a network takes ~4 s this way)."""
+    sh.run("nmcli", "device", "wifi", "rescan", "ifname", cfg.interface, check=False)
+    sh.sleep(SCAN_SETTLE)
+    r = sh.run("nmcli", "-w", "0", "device", "connect", cfg.interface, check=False)
+    if r.returncode == 0:
+        log.info("asked NetworkManager to join a known WiFi")
+    else:
+        log.info("no known WiFi to join yet (%s)", (r.stderr or "").strip() or r.returncode)
+
+
+def _log_visible_networks(sh: Shell, cfg: Config) -> None:
+    """Say WHY we are falling back: what the radio could actually see."""
+    r = sh.run("nmcli", "-t", "-f", "SSID,SIGNAL", "device", "wifi", "list",
+               "ifname", cfg.interface, check=False)
+    seen = []
+    for line in r.stdout.splitlines():
+        ssid, _, sig = line.rpartition(":")
+        ssid = ssid.replace("\\:", ":")
+        if ssid:
+            seen.append(f"{ssid} ({sig})")
+    shown = ", ".join(list(dict.fromkeys(seen))[:12]) or "nothing"
+    log.warning("no WiFi connection after %ss. NetworkManager state: %s. In range: %s",
+                cfg.boot_timeout, wifi_state(sh, cfg.interface) or "unknown", shown)
+
+
 def wait_for_wifi(sh: Shell, cfg: Config) -> bool:
     if sh.dry_run:
-        log.info("(dry run) skipping the %ss wait and pretending there's no WiFi",
-                 cfg.boot_timeout)
+        log.info("(dry run) not waiting for a WiFi connection; assuming none")
         return False
     deadline = sh.monotonic() + cfg.boot_timeout
+    last_nudge: float | None = None
     while True:
-        if wifi_connected(sh, cfg.interface):
+        state = wifi_state(sh, cfg.interface)
+        if state.startswith("connected"):
             return True
-        if sh.monotonic() >= deadline:
+        now = sh.monotonic()
+        if now >= deadline:
+            _log_visible_networks(sh, cfg)
             return False
+        # Only nudge a device that is idle and ready. Never interrupt one that is
+        # already connecting, and don't poke one that isn't up yet.
+        if state.startswith("disconnected") and (
+                last_nudge is None or now - last_nudge >= NUDGE_EVERY):
+            last_nudge = now
+            _look_and_join(sh, cfg)
         sh.sleep(1)
 
 
@@ -661,7 +713,6 @@ def cmd_start(cfg: Config, sh: Shell) -> int:
     if wait_for_wifi(sh, cfg):
         log.info("connected to WiFi; AP not needed")
         return 0
-    log.warning("no WiFi connection after %ss", cfg.boot_timeout)
     _begin_ap(sh, cfg, purpose="boot", rescue_seconds=cfg.rescue_timeout,
               require_rescue=False)
     disarm_rescue(sh)  # AP verified: the safety net has done its job

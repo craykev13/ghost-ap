@@ -56,7 +56,7 @@ class SimulatedCrash(BaseException):
 
 
 READS = (("nmcli", "-t"), ("nmcli", "-g"), ("ip", "-4"), ("hostapd_cli",), ("pgrep",),
-         ("systemctl", "is-active"))
+         ("systemctl", "is-active"), ("nmcli", "device", "wifi", "rescan"))
 
 
 class FakeSystem(ctl.Shell):
@@ -78,6 +78,8 @@ class FakeSystem(ctl.Shell):
         self.reconnect_delay = reconnect_delay      # seconds NM takes to finish connecting
         self.hostapd_enable_delay = hostapd_enable_delay
         self.daemon_exit_delay = daemon_exit_delay   # seconds a signalled daemon takes to exit
+        self.rescans = 0                             # `nmcli device wifi rescan` calls
+        self.join_calls = 0                          # `nmcli device connect` calls
         self.double_signalled = []                   # pids signalled again while shutting down
         self.pending = None                         # (profile, ready_at) while NM connects
         self.last_exit = None
@@ -156,7 +158,8 @@ class FakeSystem(ctl.Shell):
     def run(self, *cmd, check=True):
         self.log.append(cmd)
         cp = self._dispatch(list(cmd))
-        if self._is_effect(cmd):
+        failed_join = cmd[:5] == ("nmcli", "-w", "0", "device", "connect") and cp.returncode != 0
+        if self._is_effect(cmd) and not failed_join:   # a join that found nothing changes nothing
             self._tick()
         if check and cp.returncode != 0:
             raise ctl.GhostAPError(f"{cmd[0]} failed: {cp.stderr}")
@@ -183,14 +186,23 @@ class FakeSystem(ctl.Shell):
     def _dispatch(self, c):
         prog = c[0]
         if prog == "nmcli":
+            if c[1] == "-t" and "list" in c:           # nmcli -t -f SSID,SIGNAL device wifi list
+                return self._cp(c, out="".join(f"{n}:70\n" for n in sorted(self.in_range)))
             if c[1] == "-t":
                 self._maybe_autoconnect()
                 self._settle()
                 if not self.managed:
                     state = "unmanaged"
+                elif self.client:
+                    state = "connected"
+                elif self.pending:
+                    state = "connecting (getting IP configuration)"
                 else:
-                    state = "connected" if self.client else "disconnected"
+                    state = "disconnected"
                 return self._cp(c, out=f"{IFACE}:wifi:{state}\nlo:loopback:unmanaged\n")
+            if c[1:4] == ["device", "wifi", "rescan"]:
+                self.rescans += 1
+                return self._cp(c)
             if c[1] == "-g":
                 self._settle()
                 name = self.client if self.managed else None
@@ -209,6 +221,7 @@ class FakeSystem(ctl.Shell):
                 self._begin_connect(c[6])
                 return self._cp(c)
             if c[1:3] == ["-w", "0"] and c[3:5] == ["device", "connect"]:
+                self.join_calls += 1
                 for name in self.known:
                     if self.managed and name in self.in_range:
                         self._begin_connect(name)
@@ -568,6 +581,66 @@ class RecoverTests(Base):
                     self.assertIsNone(s.timer)
                 covered += 1
             self.assertGreaterEqual(covered, 4, label)
+
+
+class BootJoinTests(Base):
+    """Hardware finding: NetworkManager's own autoconnect on the Pi Zero W took about
+    as long as the old boot window, so the Pi gave up and raised the AP with the
+    hotspot sitting right there. The boot flow now rescans and asks to join."""
+
+    @staticmethod
+    @contextlib.contextmanager
+    def logs_enabled():
+        """The suite silences logging globally; these tests assert on log output."""
+        previous = logging.root.manager.disable
+        logging.disable(logging.NOTSET)
+        try:
+            yield
+        finally:
+            logging.disable(previous)
+
+    def test_joins_a_visible_network_without_waiting_for_slow_autoconnect(self):
+        s = FakeSystem(connect_after=500)          # NM would not get to it for 500 s
+        ctl.cmd_start(self.cfg, s)
+        self.assertTrue(self.is_client(s), self.describe(s))
+        self.assertIsNone(s.timer, "no AP, so no rescue timer should have been armed")
+        self.assertLess(s.now, 30, "should join within a couple of attempts")
+        self.assertGreaterEqual(s.rescans, 1)
+
+    def test_already_connected_is_left_alone(self):
+        s = FakeSystem(connected=True)
+        ctl.cmd_start(self.cfg, s)
+        self.assertEqual((s.rescans, s.join_calls), (0, 0))
+        self.assertTrue(self.is_client(s))
+
+    def test_an_activation_in_progress_is_not_interrupted(self):
+        s = FakeSystem(connect_after=500, reconnect_delay=25)   # connecting takes 25 s
+        ctl.cmd_start(self.cfg, s)
+        self.assertTrue(self.is_client(s), self.describe(s))
+        self.assertEqual(s.join_calls, 1, "asked again while a connection was in progress")
+
+    def test_falls_back_to_the_ap_when_nothing_known_is_in_range(self):
+        s = FakeSystem()
+        ctl.cmd_start(self.cfg, s)
+        self.assertTrue(self.is_ap(s), self.describe(s))
+        self.assertGreaterEqual(s.rescans, 3, "should keep looking until the deadline")
+        self.assertLessEqual(s.rescans, 7, "rescanning every few seconds would hammer the radio")
+        self.assertGreaterEqual(s.now, self.cfg.boot_timeout)
+
+    def test_fallback_says_what_was_visible(self):
+        s = FakeSystem()
+        s.in_range.add("CafeWiFi")                 # visible, but not a saved network
+        with self.logs_enabled(), self.assertLogs(ctl.log, level="WARNING") as cm:
+            ctl.cmd_start(self.cfg, s)
+        text = "\n".join(cm.output)
+        self.assertIn("CafeWiFi", text)
+        self.assertIn("no WiFi connection", text)
+
+    def test_fallback_says_when_nothing_was_visible(self):
+        s = FakeSystem()
+        with self.logs_enabled(), self.assertLogs(ctl.log, level="WARNING") as cm:
+            ctl.cmd_start(self.cfg, s)
+        self.assertIn("In range: nothing", "\n".join(cm.output))
 
 
 class GentleShutdownTests(Base):

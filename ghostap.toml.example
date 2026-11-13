@@ -1,0 +1,31 @@
+# Copy to /etc/ghostap/ghostap.toml and edit.
+# Put your AP password (8-63 characters) in the passphrase_file, NOT in here,
+# and lock it down:  sudo chmod 600 /etc/ghostap/passphrase
+
+[network]
+interface = "wlan0"
+boot_timeout = 45        # seconds to wait for normal WiFi before starting the AP
+
+[access_point]
+ssid = "ZeroFi"
+passphrase_file = "/etc/ghostap/passphrase"
+country = "US"
+channel = 6              # 1-11
+address = "192.168.4.1/24"
+
+[dhcp]
+start = "192.168.4.10"
+end = "192.168.4.50"
+lease_time = "1h"
+
+# Optional. Defaults shown.
+[recovery]
+rescue_timeout = 90      # boot: if the controller dies mid-switch, systemd runs
+                         # `ghostap recover` after this many seconds (min 30)
+reconnect_timeout = 20   # after handing the radio back, wait this long for WiFi to
+                         # actually reconnect and report it honestly (min 5)
+
+[testing]
+live_timeout = 120       # `ghostap test` gives you AT LEAST this long once the AP is up,
+                         # then reverts by itself unless you run `ghostap test --commit`
+                         # (the timer is armed ~30s earlier to cover AP startup) (min 30)

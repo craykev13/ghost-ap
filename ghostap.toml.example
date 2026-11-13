@@ -4,7 +4,7 @@
 
 [network]
 interface = "wlan0"
-boot_timeout = 45        # seconds to wait for normal WiFi before starting the AP
+boot_timeout = 60        # seconds to look for and join a known WiFi before starting the AP
 
 [access_point]
 ssid = "ZeroFi"

@@ -61,7 +61,7 @@ READS = (("nmcli", "-t"), ("nmcli", "-g"), ("ip", "-4"), ("hostapd_cli",), ("pgr
 
 class FakeSystem(ctl.Shell):
     def __init__(self, *, connected=False, connect_after=None, decoy=False,
-                 reconnect_delay=0, hostapd_enable_delay=0):
+                 reconnect_delay=0, hostapd_enable_delay=0, daemon_exit_delay=1.0):
         super().__init__(dry_run=False)
         shutil.rmtree(ctl.RUN_DIR, ignore_errors=True)   # a new machine has a clean /run
         self.now = 0.0
@@ -77,6 +77,8 @@ class FakeSystem(ctl.Shell):
         self.connect_after = connect_after
         self.reconnect_delay = reconnect_delay      # seconds NM takes to finish connecting
         self.hostapd_enable_delay = hostapd_enable_delay
+        self.daemon_exit_delay = daemon_exit_delay   # seconds a signalled daemon takes to exit
+        self.double_signalled = []                   # pids signalled again while shutting down
         self.pending = None                         # (profile, ready_at) while NM connects
         self.last_exit = None
         self.ip = None
@@ -113,6 +115,7 @@ class FakeSystem(ctl.Shell):
     # ---- Shell interface -------------------------------------------------
     def sleep(self, seconds):
         self.now += seconds
+        self._reap()
 
     def monotonic(self):
         return self.now
@@ -120,11 +123,28 @@ class FakeSystem(ctl.Shell):
     def wallclock(self):
         return 1_000_000.0 + self.now
 
+    def _reap(self):
+        for pid, p in list(self.procs.items()):
+            if p.get("exit_at") is not None and self.now >= p["exit_at"]:
+                del self.procs[pid]
+
+    def _signal(self, pid):
+        p = self.procs.get(pid)
+        if p is None:
+            return
+        if p.get("exit_at") is not None:
+            # Second signal mid-teardown: on real brcmfmac this wedges the firmware.
+            self.double_signalled.append(pid)
+            return
+        p["exit_at"] = self.now + self.daemon_exit_delay
+
     def pid_alive(self, pid):
+        self._reap()
         return pid in self.procs
 
     def kill(self, pid):
-        self.procs.pop(pid, None)
+        self._reap()
+        self._signal(pid)
         self._tick()
 
     def mark(self, what):
@@ -225,11 +245,12 @@ class FakeSystem(ctl.Shell):
             return self._cp(c, 1, err="Failed to connect to hostapd")
         if prog in ("pkill", "pgrep"):
             pattern = c[-1]
+            self._reap()
             hits = [pid for pid, p in self.procs.items() if pattern in p["cmdline"]]
             if prog == "pkill":
                 for pid in hits:
-                    del self.procs[pid]
-            return self._cp(c, 0 if hits else 1)
+                    self._signal(pid)
+            return self._cp(c, 0 if hits else 1, out="\n".join(map(str, hits)))
         if prog == "systemd-run":
             if self.fail_systemd_run:
                 return self._cp(c, 1, err="Failed to connect to bus")
@@ -547,6 +568,68 @@ class RecoverTests(Base):
                     self.assertIsNone(s.timer)
                 covered += 1
             self.assertGreaterEqual(covered, 4, label)
+
+
+class GentleShutdownTests(Base):
+    """Hardware finding (Stage B): a second SIGTERM sent to hostapd while it was
+    still tearing the AP down made brcmfmac log -512 (ERESTARTSYS) and left the
+    WiFi firmware out of step with the driver. Every daemon gets ONE signal."""
+
+    def assertGentle(self, s):
+        self.assertEqual(s.double_signalled, [],
+                         "daemon signalled again while shutting down: " + self.describe(s))
+
+    def test_rollback_signals_each_daemon_once(self):
+        s = FakeSystem(connected=True, decoy=True)
+        ctl.cmd_test_start(self.cfg, s)
+        s.fire_timer(self.cfg)
+        self.assertTrue(self.is_client(s), self.describe(s))
+        self.assertGentle(s)
+
+    def test_stop_signals_each_daemon_once(self):
+        s = FakeSystem(connected=False)
+        ctl.cmd_start(self.cfg, s)
+        self.assertTrue(self.is_ap(s))
+        ctl.cmd_stop(self.cfg, s)
+        self.assertGentle(s)
+
+    def test_slow_teardown_is_waited_for_not_repeated(self):
+        s = FakeSystem(connected=True, decoy=True, daemon_exit_delay=6.0)
+        ctl.cmd_test_start(self.cfg, s)
+        s.fire_timer(self.cfg)
+        self.assertTrue(self.is_client(s), self.describe(s))
+        self.assertGentle(s)
+        self.assertFalse(s.procs, "daemons must really be gone before NM gets the radio back")
+
+    def test_radio_is_not_handed_back_while_a_daemon_is_still_exiting(self):
+        s = FakeSystem(connected=True, decoy=True, daemon_exit_delay=3.0)
+        ctl.cmd_test_start(self.cfg, s)
+        seen = []
+        orig = s._dispatch
+
+        def spy(c):
+            if c[:4] == ["nmcli", "device", "set", IFACE] and c[-1] == "yes":
+                seen.append(sorted(s.procs))
+            return orig(c)
+        s._dispatch = spy
+        s.fire_timer(self.cfg)
+        self.assertEqual(seen, [[]], "NetworkManager got the radio while hostapd was alive")
+
+    def test_orphan_without_pid_file_gets_exactly_one_signal(self):
+        s = FakeSystem(connected=True, decoy=True)
+        ctl.cmd_test_start(self.cfg, s)
+        ctl.HOSTAPD_PID.unlink()
+        ctl.DNSMASQ_PID.unlink()
+        s.fire_timer(self.cfg)
+        self.assertTrue(self.is_client(s), self.describe(s))
+        self.assertFalse(s.procs)
+        self.assertGentle(s)
+
+    def test_a_stuck_daemon_is_not_signalled_a_second_time(self):
+        s = FakeSystem(connected=True, decoy=True, daemon_exit_delay=10_000)
+        ctl.cmd_test_start(self.cfg, s)
+        s.fire_timer(self.cfg)
+        self.assertGentle(s)
 
 
 class LiveTestTests(Base):

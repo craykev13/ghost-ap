@@ -1,0 +1,20 @@
+[Unit]
+Description=GhostAP: join WiFi or fall back to an access point
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=oneshot
+# RemainAfterExit keeps the service "active" after the script exits, so systemd
+# doesn't tear down hostapd/dnsmasq the moment `start` finishes.
+RemainAfterExit=yes
+# KillMode=process: if the controller itself is killed or times out, systemd
+# kills ONLY the controller, never hostapd/dnsmasq. Once the rescue timer is
+# disarmed, a working AP must not die just because its launcher did.
+# (A deliberate `systemctl stop` still cleans up, via ExecStop below.)
+KillMode=process
+ExecStart=/usr/local/bin/ghostap start
+ExecStop=/usr/local/bin/ghostap stop
+
+[Install]
+WantedBy=multi-user.target

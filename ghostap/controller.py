@@ -57,7 +57,7 @@ STARTUP_ALLOWANCE = 30
 EXIT_NOT_RECONNECTED = 3
 
 REQUIRED_TOOLS = ("nmcli", "ip", "hostapd", "hostapd_cli", "dnsmasq",
-                  "systemd-run", "systemctl", "pkill", "pgrep")
+                  "systemd-run", "systemctl", "pgrep")
 HANDLED_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
 
 log = logging.getLogger("ghostap")
@@ -436,25 +436,62 @@ def verify_ap(sh: Shell, cfg: Config, timeout: int = 15) -> None:
     )
 
 
+STOP_PATIENCE = 10.0     # seconds to let a signalled daemon finish shutting down
+
+
+def _wait_gone(sh: Shell, pids: list[int], patience: float) -> bool:
+    """Wait for already-signalled daemons to exit. Never signals them again."""
+    deadline = sh.monotonic() + patience
+    while any(sh.pid_alive(p) for p in pids):
+        if sh.monotonic() >= deadline:
+            return False
+        sh.sleep(0.2)
+    return True
+
+
 def _kill_daemons(sh: Shell) -> bool:
-    killed = False
+    """Stop our hostapd/dnsmasq: ONE SIGTERM each, then wait.
+
+    A second signal while hostapd is still tearing the AP down interrupts the
+    driver's wait for the WiFi firmware (-ERESTARTSYS, "-512" in dmesg). On the
+    Pi Zero W's brcmfmac that leaves the firmware out of step with the driver
+    and the link stays flaky until reboot. Seen on hardware: the pid-file kill
+    was followed 140 ms later by a pkill sweep. So: signal once, wait for exit,
+    and only sweep up processes we have not already signalled.
+    """
+    signalled: list[int] = []
     for pid_file in (DNSMASQ_PID, HOSTAPD_PID):
         pid = _read_pid(pid_file)
         if pid is not None and sh.pid_alive(pid):
             log.info("stopping pid %s (%s)", pid, pid_file.name)
             sh.kill(pid)
-            killed = True
+            signalled.append(pid)
         if not sh.dry_run:
             pid_file.unlink(missing_ok=True)
-    # Belt and braces: a daemon can outlive its pid file, or never get one
-    # (the controller can die between `hostapd -B` and the pid file appearing).
-    # Our daemons are the ones started from our own config files.
+    if signalled and not sh.dry_run:
+        if not _wait_gone(sh, signalled, STOP_PATIENCE):
+            stuck = [p for p in signalled if sh.pid_alive(p)]
+            log.warning("pid(s) %s still shutting down after %.0fs; not signalling again",
+                        stuck, STOP_PATIENCE)
+    killed = bool(signalled)
+    # A daemon can outlive its pid file, or never get one (the controller can die
+    # between `hostapd -B` and the pid file appearing). Ours are the ones started
+    # from our own config files. Find them, skip anything already signalled.
+    orphans: list[int] = []
     for conf in (DNSMASQ_CONF, HOSTAPD_CONF):
-        r = sh.run("pkill", "-f", "--", str(conf), check=False)
+        r = sh.run("pgrep", "-f", "--", str(conf), check=False)
         if r.returncode == 0 and not sh.dry_run:
-            killed = True
+            for tok in r.stdout.split():
+                if tok.isdigit() and int(tok) not in signalled and int(tok) != os.getpid():
+                    orphans.append(int(tok))
+    for pid in dict.fromkeys(orphans):
+        log.info("stopping orphan pid %s", pid)
+        sh.kill(pid)
+        killed = True
+    if orphans and not sh.dry_run:
+        _wait_gone(sh, orphans, STOP_PATIENCE)
     if killed:
-        sh.sleep(1)
+        sh.sleep(1)       # let the driver finish its own teardown
     return killed
 
 

@@ -95,6 +95,7 @@ class Config:
     live_timeout: int
     path: Path
     reconnect_timeout: int = 20
+    hostapd_debug: bool = False       # log every handshake step to the journal
 
 
 def _read_secret(path: Path) -> str:
@@ -158,6 +159,7 @@ def load_config(path: Path) -> Config:
             live_timeout=int(raw.get("testing", {}).get("live_timeout", 120)),
             path=Path(path).resolve(),
             reconnect_timeout=int(raw.get("recovery", {}).get("reconnect_timeout", 20)),
+            hostapd_debug=bool(ap.get("hostapd_debug", False)),
         )
         validate(cfg)
     except KeyError as e:
@@ -406,6 +408,8 @@ def render_hostapd(cfg: Config) -> str:
         "rsn_pairwise=CCMP",
         "ieee80211w=0",
         "auth_algs=1",
+        *(["# diagnostics: read with  journalctl -t hostapd",
+           "logger_syslog=-1", "logger_syslog_level=0"] if cfg.hostapd_debug else []),
         "",
     ])
 

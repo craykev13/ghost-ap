@@ -1,0 +1,8 @@
+#!/bin/sh
+# NetworkManager dispatcher hook for GhostAP. NetworkManager runs this only when
+# something happens: $1 = interface, $2 = action. Nothing polls or scans.
+# GhostAP decides what the event means (start or cancel the failover countdown).
+case "$2" in
+    up|down) /usr/bin/python3 /usr/local/bin/ghostap event "$1" "$2" >/dev/null 2>&1 || true ;;
+esac
+exit 0

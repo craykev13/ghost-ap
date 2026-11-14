@@ -13,8 +13,10 @@ RemainAfterExit=yes
 # disarmed, a working AP must not die just because its launcher did.
 # (A deliberate `systemctl stop` still cleans up, via ExecStop below.)
 KillMode=process
-ExecStart=/usr/local/bin/ghostap start
-ExecStop=/usr/local/bin/ghostap stop
+# Launched through python3 on purpose: it keeps working even if a copy of the
+# script loses its executable bit (which would otherwise break boot silently).
+ExecStart=/usr/bin/python3 /usr/local/bin/ghostap start
+ExecStop=/usr/bin/python3 /usr/local/bin/ghostap stop
 
 [Install]
 WantedBy=multi-user.target

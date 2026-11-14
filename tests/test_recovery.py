@@ -87,7 +87,7 @@ class FakeSystem(ctl.Shell):
         self.ip = None
         self.procs = {}                  # pid -> {name, cmdline, enabled}
         self.next_pid = 1000
-        self.timer = None                # {"due": seconds, "argv": [...]}
+        self.timers = {}                 # unit -> {"due": seconds, "argv": [...]}
         self.log = []
         self.effect_count = 0
         self.crash_at = None             # raise SimulatedCrash after this many effects
@@ -98,6 +98,21 @@ class FakeSystem(ctl.Shell):
         self.hostapd_no_pidfile = False
         self.fail_systemd_run = False
         self.systemd_run_half_creates = False   # timer gets created, THEN the call errors
+
+    @property
+    def timer(self):                     # the rescue timer; most tests only care about this one
+        return self.timers.get("ghostap-rescue")
+
+    @timer.setter
+    def timer(self, value):
+        if value is None:
+            self.timers.pop("ghostap-rescue", None)
+        else:
+            self.timers["ghostap-rescue"] = value
+
+    @property
+    def failover_timer(self):
+        return self.timers.get("ghostap-failover")
 
     # ---- fault injection -------------------------------------------------
     def _tick(self):
@@ -268,22 +283,22 @@ class FakeSystem(ctl.Shell):
         if prog == "systemd-run":
             if self.fail_systemd_run:
                 return self._cp(c, 1, err="Failed to connect to bus")
-            if self.systemd_run_half_creates:
+            unit = next(a for a in c if a.startswith("--unit=")).split("=", 1)[1]
+            if self.systemd_run_half_creates and unit == "ghostap-rescue":
                 self.timer = {"due": self.now + 1, "secs": 1, "argv": [], "cmd": tuple(c)}
                 return self._cp(c, 1, err="Failed to start transient service unit")
-            if self.timer is not None:
-                return self._cp(c, 1, err="Unit ghostap-rescue.timer already exists.")
+            if unit in self.timers:
+                return self._cp(c, 1, err=f"Unit {unit}.timer already exists.")
             secs = int(next(a for a in c if a.startswith("--on-active=")).split("=")[1][:-1])
-            self.timer = {"due": self.now + secs, "secs": secs, "argv": c[c.index("--") + 1:],
-                          "cmd": tuple(c)}
+            self.timers[unit] = {"due": self.now + secs, "secs": secs,
+                                 "argv": c[c.index("--") + 1:], "cmd": tuple(c)}
             return self._cp(c)
         if prog == "systemctl":
             if c[1] == "is-active":
-                armed = self.timer is not None
+                armed = c[2].removesuffix(".timer") in self.timers
                 return self._cp(c, 0 if armed else 3, out="active\n" if armed else "inactive\n")
             if c[1] == "stop" and c[2].endswith(".timer"):
-                had = self.timer is not None
-                self.timer = None
+                had = self.timers.pop(c[2].removesuffix(".timer"), None) is not None
                 return self._cp(c, 0 if had else 5)
             return self._cp(c)
         raise AssertionError(f"FakeSystem doesn't know this command: {c}")
@@ -307,6 +322,19 @@ class FakeSystem(ctl.Shell):
         args = ctl.build_parser().parse_args(argv[2:])      # [python, script, "recover", ...]
         assert args.command == "recover", argv
         self.last_exit = ctl.cmd_recover(cfg, self, expect=args.expect, original=args.original)
+        return True
+
+
+    def fire_failover(self, cfg):
+        """The failover countdown ends: systemd runs `ghostap failover` in a fresh process."""
+        timer = self.timers.pop("ghostap-failover", None)
+        if timer is None:
+            return False
+        self.now = max(self.now, timer["due"])
+        self.crash_at = self.interrupt_at = None
+        args = ctl.build_parser().parse_args(timer["argv"][2:])
+        assert args.command == "failover", timer["argv"]
+        self.last_exit = ctl.cmd_failover(cfg, self)
         return True
 
 
@@ -609,6 +637,185 @@ class ApDiagnosticsTests(Base):
                 f'passphrase_file = "{d / "pw"}"\n{extra}'
                 '[dhcp]\nstart = "192.168.4.10"\nend = "192.168.4.50"\n')
             self.assertEqual(ctl.load_config(d / "c.toml").hostapd_debug, want, flag)
+
+
+class FailoverTests(Base):
+    """Connection loss AFTER boot: NetworkManager reports the drop, a countdown runs,
+    and if WiFi is still gone the Pi raises the AP. Event-driven: no polling."""
+
+    def setUp(self):
+        super().setUp()
+        self.cfg = dataclasses.replace(self.cfg, failover_grace=120, failover_join_timeout=30)
+
+    def drop(self, *, findable):
+        """A Pi that was connected and then lost WiFi. `findable`: the network is still
+        in range, NetworkManager just isn't getting to it."""
+        s = FakeSystem(connected=True, connect_after=10 ** 6 if findable else None)
+        s.client = None
+        s.pending = None
+        if not findable:
+            s.in_range = set()
+        return s
+
+    def down(self, s):
+        return ctl.cmd_event(self.cfg, s, IFACE, "down")
+
+    # ---- the countdown ---------------------------------------------------
+    def test_wifi_going_down_starts_the_countdown(self):
+        s = self.drop(findable=False)
+        self.down(s)
+        self.assertIsNotNone(s.failover_timer)
+        self.assertEqual(s.failover_timer["secs"], 120)
+        self.assertIsNone(s.timer, "the rescue timer is for AP switches, not for this")
+
+    def test_wifi_coming_back_cancels_it(self):
+        s = self.drop(findable=False)
+        self.down(s)
+        ctl.cmd_event(self.cfg, s, IFACE, "up")
+        self.assertIsNone(s.failover_timer)
+
+    def test_flapping_restarts_the_countdown_from_the_last_drop(self):
+        s = self.drop(findable=False)
+        self.down(s)
+        s.sleep(100)
+        self.down(s)
+        self.assertEqual(s.failover_timer["due"], s.now + 120)
+
+    def test_off_by_default(self):
+        s = self.drop(findable=False)
+        ctl.cmd_event(dataclasses.replace(self.cfg, failover_grace=0), s, IFACE, "down")
+        self.assertFalse(s.timers)
+        self.assertFalse([c for c in s.log if c[0] == "systemd-run"])
+
+    def test_other_interfaces_and_actions_are_ignored(self):
+        s = self.drop(findable=False)
+        ctl.cmd_event(self.cfg, s, "eth0", "down")
+        self.assertFalse(s.timers, "another interface must not start our countdown")
+        ctl.cmd_event(self.cfg, s, IFACE, "dhcp4-change")
+        self.assertFalse(s.timers, "only up/down mean anything")
+        ctl.cmd_event(self.cfg, s, IFACE, "up")          # nothing armed: harmless
+        self.assertFalse(s.timers)
+
+    def test_a_down_event_while_we_hold_the_radio_is_ignored(self):
+        s = FakeSystem(connected=True, decoy=True)
+        ctl.cmd_test_start(self.cfg, s)                  # we took the radio ourselves
+        self.assertTrue(self.is_ap(s))
+        self.down(s)                                     # NetworkManager reports it going down
+        self.assertIsNone(s.failover_timer)
+
+    # ---- when the countdown ends ----------------------------------------
+    def test_failover_rejoins_if_the_network_is_still_findable(self):
+        s = self.drop(findable=True)
+        self.down(s)
+        s.fire_failover(self.cfg)
+        self.assertTrue(self.is_client(s), self.describe(s))
+        self.assertFalse(s.procs, "no AP should have been raised")
+        self.assertLess(s.now - 120, 40)
+
+    def test_failover_raises_the_ap_when_wifi_is_really_gone(self):
+        s = self.drop(findable=False)
+        self.down(s)
+        s.fire_failover(self.cfg)
+        self.assertTrue(self.is_ap(s), self.describe(s))
+        self.assertGreaterEqual(s.now, 120 + 30, "should look for WiFi once more first")
+        state = ctl.read_state()
+        self.assertEqual((state["purpose"], state["committed"]), ("boot", True))
+        self.assertIsNone(s.timer, "rescue timer must be disarmed once the AP is verified")
+
+    def test_the_failover_ap_stays_up(self):
+        s = self.drop(findable=False)
+        self.down(s)
+        s.fire_failover(self.cfg)
+        self.assertFalse(s.fire_timer(self.cfg), "nothing left to fire")
+        self.assertTrue(self.is_ap(s), self.describe(s))
+
+    def test_failover_does_nothing_if_wifi_came_back(self):
+        s = self.drop(findable=True)
+        self.down(s)
+        s.client = ORIGINAL                              # it reconnected by itself
+        before = len(s.log)
+        s.fire_failover(self.cfg)
+        self.assertTrue(self.is_client(s))
+        self.assertFalse(s.procs)
+        self.assertFalse([c for c in s.log[before:] if c[0] in ("hostapd", "dnsmasq")])
+
+    def test_failover_does_nothing_if_an_ap_is_already_running(self):
+        s = FakeSystem()
+        ctl.cmd_start(self.cfg, s)                       # boot fallback AP
+        self.assertTrue(self.is_ap(s))
+        snapshot = (s.managed, s.ip, dict(s.procs), dict(s.timers))
+        ctl.cmd_failover(self.cfg, s)
+        self.assertEqual(snapshot, (s.managed, s.ip, dict(s.procs), dict(s.timers)))
+
+    def test_failover_does_nothing_during_a_live_test(self):
+        s = FakeSystem(connected=True, decoy=True)
+        ctl.cmd_test_start(self.cfg, s)
+        procs = dict(s.procs)
+        ctl.cmd_failover(self.cfg, s)
+        self.assertEqual(procs, dict(s.procs))
+        self.assertEqual(ctl.read_state()["purpose"], "test")
+
+    def test_if_the_ap_cannot_start_the_radio_goes_back_to_networkmanager(self):
+        s = self.drop(findable=False)
+        s.fail_hostapd = True
+        self.down(s)
+        with self.assertRaises(ctl.GhostAPError):
+            s.fire_failover(self.cfg)
+        self.assertTrue(s.managed)
+        self.assertFalse(s.procs)
+        self.assertIsNone(ctl.read_state())
+
+    # ---- wiring -----------------------------------------------------------
+    def test_status_shows_the_countdown(self):
+        s = self.drop(findable=False)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            ctl.cmd_status(self.cfg, s)
+        self.assertIn("countdown not running", out.getvalue())
+        self.down(s)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            ctl.cmd_status(self.cfg, s)
+        self.assertIn("countdown RUNNING", out.getvalue())
+
+    def test_event_arguments_parse(self):
+        args = ctl.build_parser().parse_args(["event", "wlan0", "down"])
+        self.assertEqual((args.command, args.event_args), ("event", ["wlan0", "down"]))
+        for bad in (["event", "wlan0"], ["start", "wlan0"]):
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                ctl.main(bad)
+
+    def test_settings_come_from_the_config_file_and_are_validated(self):
+        d = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        (d / "pw").write_text("testpass123\n")
+        os.chmod(d / "pw", 0o600)
+
+        def load(recovery):
+            (d / "c.toml").write_text(
+                '[network]\ninterface = "wlan0"\n[access_point]\nssid = "ZeroFi"\n'
+                f'passphrase_file = "{d / "pw"}"\n[recovery]\n{recovery}'
+                '[dhcp]\nstart = "192.168.4.10"\nend = "192.168.4.50"\n')
+            return ctl.load_config(d / "c.toml")
+
+        cfg = load("failover_grace = 90\nfailover_join_timeout = 25\n")
+        self.assertEqual((cfg.failover_grace, cfg.failover_join_timeout), (90, 25))
+        self.assertEqual(load("").failover_grace, 0, "must be opt-in")
+        self.assertEqual(load("failover_grace = 0\n").failover_grace, 0)
+        with self.assertRaises(ctl.GhostAPError):
+            load("failover_grace = 5\n")
+        with self.assertRaises(ctl.GhostAPError):
+            load("failover_join_timeout = 3\n")
+
+    def test_the_networkmanager_hook_only_forwards_up_and_down(self):
+        hook = HERE.parent / "nm-dispatcher" / "90-ghostap"
+        if not hook.exists():
+            self.skipTest("nm-dispatcher/90-ghostap not found next to the tests")
+        lines = [l.strip() for l in hook.read_text().splitlines()
+                 if l.strip() and not l.lstrip().startswith("#")]
+        self.assertIn("up|down)", " ".join(lines))
+        self.assertTrue(any('ghostap event "$1" "$2"' in l for l in lines), lines)
+        self.assertEqual(lines[-1], "exit 0", "a hook must never fail NetworkManager")
 
 
 class BootJoinTests(Base):

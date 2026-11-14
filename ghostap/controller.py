@@ -45,6 +45,7 @@ DNSMASQ_CONF = RUN_DIR / "dnsmasq.conf"
 DNSMASQ_PID = RUN_DIR / "dnsmasq.pid"
 STATE_FILE = RUN_DIR / "state.json"
 RESCUE_UNIT = "ghostap-rescue"
+FAILOVER_UNIT = "ghostap-failover"
 LOG_FILE = RUN_DIR / "ghostap.log"   # survives a dead SSH session; read it afterwards
 
 # The live-test timer is armed BEFORE the AP exists. Without headroom for startup
@@ -96,6 +97,8 @@ class Config:
     path: Path
     reconnect_timeout: int = 20
     hostapd_debug: bool = False       # log every handshake step to the journal
+    failover_grace: int = 0           # seconds WiFi may stay down before failover; 0 = off
+    failover_join_timeout: int = 30   # one last look for WiFi before raising the AP
 
 
 def _read_secret(path: Path) -> str:
@@ -123,6 +126,10 @@ def validate(cfg: Config) -> None:
         raise GhostAPError("rescue_timeout must be at least 30 seconds")
     if cfg.live_timeout < 30:
         raise GhostAPError("live_timeout must be at least 30 seconds")
+    if cfg.failover_grace and cfg.failover_grace < 15:
+        raise GhostAPError("failover_grace must be 0 (off) or at least 15 seconds")
+    if cfg.failover_join_timeout < 10:
+        raise GhostAPError("failover_join_timeout must be at least 10 seconds")
     if cfg.reconnect_timeout < 5:
         raise GhostAPError("reconnect_timeout must be at least 5 seconds")
     net = cfg.address.network
@@ -160,6 +167,8 @@ def load_config(path: Path) -> Config:
             path=Path(path).resolve(),
             reconnect_timeout=int(raw.get("recovery", {}).get("reconnect_timeout", 20)),
             hostapd_debug=bool(ap.get("hostapd_debug", False)),
+            failover_grace=int(raw.get("recovery", {}).get("failover_grace", 0)),
+            failover_join_timeout=int(raw.get("recovery", {}).get("failover_join_timeout", 30)),
         )
         validate(cfg)
     except KeyError as e:
@@ -351,7 +360,7 @@ def _look_and_join(sh: Shell, cfg: Config) -> None:
         log.info("no known WiFi to join yet (%s)", (r.stderr or "").strip() or r.returncode)
 
 
-def _log_visible_networks(sh: Shell, cfg: Config) -> None:
+def _log_visible_networks(sh: Shell, cfg: Config, timeout: int) -> None:
     """Say WHY we are falling back: what the radio could actually see."""
     r = sh.run("nmcli", "-t", "-f", "SSID,SIGNAL", "device", "wifi", "list",
                "ifname", cfg.interface, check=False)
@@ -363,14 +372,15 @@ def _log_visible_networks(sh: Shell, cfg: Config) -> None:
             seen.append(f"{ssid} ({sig})")
     shown = ", ".join(list(dict.fromkeys(seen))[:12]) or "nothing"
     log.warning("no WiFi connection after %ss. NetworkManager state: %s. In range: %s",
-                cfg.boot_timeout, wifi_state(sh, cfg.interface) or "unknown", shown)
+                timeout, wifi_state(sh, cfg.interface) or "unknown", shown)
 
 
-def wait_for_wifi(sh: Shell, cfg: Config) -> bool:
+def wait_for_wifi(sh: Shell, cfg: Config, timeout: int | None = None) -> bool:
+    timeout = cfg.boot_timeout if timeout is None else timeout
     if sh.dry_run:
         log.info("(dry run) not waiting for a WiFi connection; assuming none")
         return False
-    deadline = sh.monotonic() + cfg.boot_timeout
+    deadline = sh.monotonic() + timeout
     last_nudge: float | None = None
     while True:
         state = wifi_state(sh, cfg.interface)
@@ -378,7 +388,7 @@ def wait_for_wifi(sh: Shell, cfg: Config) -> bool:
             return True
         now = sh.monotonic()
         if now >= deadline:
-            _log_visible_networks(sh, cfg)
+            _log_visible_networks(sh, cfg, timeout)
             return False
         # Only nudge a device that is idle and ready. Never interrupt one that is
         # already connecting, and don't poke one that isn't up yet.
@@ -459,6 +469,23 @@ def arm_rescue(sh: Shell, seconds: int, command: list[str]) -> None:
     sh.run("systemd-run", f"--unit={RESCUE_UNIT}", f"--on-active={seconds}s",
            "--timer-property=AccuracySec=1s", "--collect",
            "--description=GhostAP rescue", "--", *command)
+
+
+def disarm_failover(sh: Shell) -> None:
+    # Stop only the TIMER. If the failover run itself is already going, leave it be.
+    sh.run("systemctl", "stop", f"{FAILOVER_UNIT}.timer", check=False)
+
+
+def arm_failover(sh: Shell, cfg: Config) -> None:
+    """Start the countdown to failover. Re-arming restarts it, so the grace period
+    always counts from the LAST time WiFi dropped."""
+    disarm_failover(sh)
+    sh.run("systemctl", "reset-failed", f"{FAILOVER_UNIT}.service",
+           f"{FAILOVER_UNIT}.timer", check=False)
+    sh.run("systemd-run", f"--unit={FAILOVER_UNIT}", f"--on-active={cfg.failover_grace}s",
+           "--timer-property=AccuracySec=1s", "--collect",
+           "--description=GhostAP failover", "--",
+           sys.executable, str(Path(__file__).resolve()), "failover", "--config", str(cfg.path))
 
 
 # --------------------------------------------------------------------------
@@ -723,6 +750,44 @@ def cmd_start(cfg: Config, sh: Shell) -> int:
     return 0
 
 
+def cmd_event(cfg: Config, sh: Shell, iface: str, action: str) -> int:
+    """Called by the NetworkManager hook when an interface goes up or down. It only
+    starts or cancels a countdown, so nothing runs in the background in between."""
+    if cfg.failover_grace <= 0 or iface != cfg.interface:
+        return 0
+    if action == "up":
+        disarm_failover(sh)
+    elif action == "down":
+        if _daemons_present(sh) or read_state() is not None:
+            # We took the radio ourselves (AP up, or a switch under way).
+            log.info("event: %s down while an AP/transition is active; ignoring", iface)
+            return 0
+        log.info("event: %s went down; failover in %ss unless WiFi returns",
+                 iface, cfg.failover_grace)
+        arm_failover(sh, cfg)
+    return 0
+
+
+def cmd_failover(cfg: Config, sh: Shell) -> int:
+    """The countdown ended. If WiFi is still gone, look once more, then raise the AP."""
+    preflight(cfg, sh)
+    if _daemons_present(sh) or read_state() is not None:
+        log.info("failover: an AP or a switch is already in progress; nothing to do")
+        return 0
+    if wifi_connected(sh, cfg.interface):
+        log.info("failover: WiFi is back; nothing to do")
+        return 0
+    log.warning("failover: WiFi has been down for %ss; one last look", cfg.failover_grace)
+    if wait_for_wifi(sh, cfg, timeout=cfg.failover_join_timeout):
+        log.info("failover: rejoined WiFi; AP not needed")
+        return 0
+    log.warning("failover: still no WiFi; raising the fallback AP")
+    _begin_ap(sh, cfg, purpose="boot", rescue_seconds=cfg.rescue_timeout,
+              require_rescue=False)
+    disarm_rescue(sh)
+    return 0
+
+
 def cmd_stop(cfg: Config, sh: Shell) -> int:
     if not _daemons_present(sh) and read_state() is None:
         log.info("no AP running; nothing to stop")
@@ -750,6 +815,12 @@ def cmd_status(cfg: Config, sh: Shell) -> int:
               "Keep it: ghostap test --commit   Revert now: ghostap test --abort")
     armed = sh.run("systemctl", "is-active", f"{RESCUE_UNIT}.timer", check=False)
     print("rescue timer: " + ("armed" if armed.stdout.strip() == "active" else "not armed"))
+    if cfg.failover_grace > 0:
+        fo = sh.run("systemctl", "is-active", f"{FAILOVER_UNIT}.timer", check=False)
+        print(f"failover: on ({cfg.failover_grace}s grace), countdown "
+              + ("RUNNING" if fo.stdout.strip() == "active" else "not running"))
+    else:
+        print("failover: off")
     return 0
 
 
@@ -834,7 +905,8 @@ def cmd_test_abort(cfg: Config, sh: Shell) -> int:
 
 
 COMMANDS = {"start": cmd_start, "stop": cmd_stop, "status": cmd_status,
-            "recover": cmd_recover, "test": cmd_test_start}
+            "recover": cmd_recover, "test": cmd_test_start,
+            "failover": cmd_failover, "event": cmd_event}
 
 
 def _install_signal_handlers() -> None:
@@ -870,6 +942,8 @@ def build_parser() -> argparse.ArgumentParser:
         description="Join WiFi at boot, or fall back to your own access point.",
     )
     p.add_argument("command", choices=COMMANDS)
+    p.add_argument("event_args", nargs="*", metavar="IFACE ACTION",
+                   help="(event) interface and up/down, as passed by NetworkManager")
     p.add_argument("-c", "--config", type=Path, default=DEFAULT_CONFIG)
     p.add_argument("--dry-run", action="store_true",
                    help="show what would happen; change nothing")
@@ -887,6 +961,10 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
     if (args.commit or args.abort) and args.command != "test":
         p.error("--commit and --abort only apply to the 'test' command")
+    if args.event_args and args.command != "event":
+        p.error("extra arguments only apply to the 'event' command")
+    if args.command == "event" and len(args.event_args) != 2:
+        p.error("event needs an interface and an action: ghostap event wlan0 down")
     if (args.expect or args.original) and args.command != "recover":
         p.error("--expect and --original only apply to the 'recover' command")
 
@@ -898,6 +976,8 @@ def main(argv: list[str] | None = None) -> int:
         sh = Shell(args.dry_run)
         if args.command == "recover":
             return cmd_recover(cfg, sh, expect=args.expect, original=args.original)
+        if args.command == "event":
+            return cmd_event(cfg, sh, *args.event_args)
         if args.command == "test":
             fn = cmd_test_commit if args.commit else cmd_test_abort if args.abort else cmd_test_start
         else:

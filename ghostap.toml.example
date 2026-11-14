@@ -25,6 +25,10 @@ rescue_timeout = 90      # boot: if the controller dies mid-switch, systemd runs
                          # `ghostap recover` after this many seconds (min 30)
 reconnect_timeout = 20   # after handing the radio back, wait this long for WiFi to
                          # actually reconnect and report it honestly (min 5)
+failover_grace = 0       # 0 = off. If WiFi drops AFTER boot and stays down this many
+                         # seconds, take one last look and then raise the AP. Needs the
+                         # NetworkManager hook (nm-dispatcher/90-ghostap). Suggested: 120.
+failover_join_timeout = 30   # that last look for WiFi, in seconds (min 10)
 
 [testing]
 live_timeout = 120       # `ghostap test` gives you AT LEAST this long once the AP is up,

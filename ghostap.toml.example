@@ -12,6 +12,7 @@ passphrase_file = "/etc/ghostap/passphrase"
 country = "US"
 channel = 6              # 1-11
 address = "192.168.4.1/24"
+hostapd_debug = false     # true: log every handshake step (journalctl -t hostapd)
 
 [dhcp]
 start = "192.168.4.10"

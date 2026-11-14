@@ -89,6 +89,7 @@ class FakeSystem(ctl.Shell):
         self.next_pid = 1000
         self.timers = {}                 # unit -> {"due": seconds, "argv": [...]}
         self.log = []
+        self.captures = []
         self.effect_count = 0
         self.crash_at = None             # raise SimulatedCrash after this many effects
         self.interrupt_at = None         # raise ctl.Interrupted after this many effects
@@ -98,6 +99,7 @@ class FakeSystem(ctl.Shell):
         self.hostapd_no_pidfile = False
         self.fail_systemd_run = False
         self.systemd_run_half_creates = False   # timer gets created, THEN the call errors
+        self.fail_snapshot_timer = False        # only the follow-up snapshot timer can't be armed
 
     @property
     def timer(self):                     # the rescue timer; most tests only care about this one
@@ -170,6 +172,11 @@ class FakeSystem(ctl.Shell):
 
     def environment_problems(self, cfg):
         return []
+
+    def capture(self, *cmd):
+        """Diagnostic dumps are read-only: they must never count as an effect."""
+        self.captures.append(cmd)
+        return f"(fake output of {' '.join(cmd)})"
 
     def run(self, *cmd, check=True):
         self.log.append(cmd)
@@ -284,6 +291,8 @@ class FakeSystem(ctl.Shell):
             if self.fail_systemd_run:
                 return self._cp(c, 1, err="Failed to connect to bus")
             unit = next(a for a in c if a.startswith("--unit=")).split("=", 1)[1]
+            if self.fail_snapshot_timer and unit == "ghostap-snapshot":
+                return self._cp(c, 1, err="Failed to connect to bus")
             if self.systemd_run_half_creates and unit == "ghostap-rescue":
                 self.timer = {"due": self.now + 1, "secs": 1, "argv": [], "cmd": tuple(c)}
                 return self._cp(c, 1, err="Failed to start transient service unit")
@@ -346,7 +355,7 @@ class Base(unittest.TestCase):
         for name, value in dict(
             RUN_DIR=run, HOSTAPD_CONF=run / "hostapd.conf", HOSTAPD_PID=run / "hostapd.pid",
             DNSMASQ_CONF=run / "dnsmasq.conf", DNSMASQ_PID=run / "dnsmasq.pid",
-            STATE_FILE=run / "state.json",
+            STATE_FILE=run / "state.json", SNAPSHOT_FILE=pathlib.Path(tmp.name) / "snap" / "ap-snapshots.log",
         ).items():
             p = mock.patch.object(ctl, name, value)
             p.start()
@@ -1387,6 +1396,103 @@ end = "192.168.4.50"
     def test_rescue_timeout_must_outlast_a_normal_switch(self):
         with self.assertRaises(ctl.GhostAPError):
             ctl.load_config(self.write_config("[recovery]\nrescue_timeout = 10\n"))
+
+
+class SnapshotTests(Base):
+    """When an AP won't show up on a phone, the evidence is the radio's state at that
+    moment. It is saved to disk, so it is still there after the reboot you do next."""
+
+    def read(self):
+        return ctl.SNAPSHOT_FILE.read_text()
+
+    def test_an_ap_coming_up_saves_a_snapshot_to_disk(self):
+        s = FakeSystem()
+        ctl.cmd_start(self.cfg, s)
+        text = self.read()
+        self.assertIn("[AP up]", text)
+        self.assertIn("purpose=boot", text)
+        for cmd in ("iw dev", "hostapd_cli -i wlan0 status", "pgrep -a hostapd",
+                    "iw dev wlan0 station dump", "journalctl -k"):
+            self.assertIn(f"--- {cmd}", text, cmd)
+
+    def test_no_wifi_needed_means_no_snapshot(self):
+        s = FakeSystem(connect_after=10)
+        ctl.cmd_start(self.cfg, s)
+        self.assertFalse(ctl.SNAPSHOT_FILE.exists())
+        self.assertNotIn("ghostap-snapshot", s.timers)
+
+    def test_snapshot_commands_are_read_only_and_never_count_as_changes(self):
+        s = FakeSystem()
+        ctl.cmd_start(self.cfg, s)
+        self.assertTrue(s.captures)
+        self.assertFalse([c for c in s.log if c[0] in ("iw", "rfkill", "journalctl")],
+                         "diagnostics must go through capture(), not run()")
+
+    def test_a_follow_up_snapshot_is_scheduled_and_runs_later(self):
+        s = FakeSystem()
+        ctl.cmd_start(self.cfg, s)
+        timer = s.timers["ghostap-snapshot"]
+        self.assertEqual(timer["secs"], ctl.SNAPSHOT_DELAY)
+        self.assertEqual(timer["argv"][2:], ["snapshot", f"+{ctl.SNAPSHOT_DELAY}s",
+                                             "--config", str(self.cfg.path)])
+        args = ctl.build_parser().parse_args(timer["argv"][2:])
+        ctl.cmd_snapshot(self.cfg, s, *args.event_args)
+        self.assertEqual(self.read().count("====="), 4)      # two headers, each has two sides
+        self.assertIn(f"[+{ctl.SNAPSHOT_DELAY}s]", self.read())
+
+    def test_manual_snapshot_uses_a_default_label(self):
+        s = FakeSystem()
+        ctl.cmd_snapshot(self.cfg, s)
+        self.assertIn("[manual]", self.read())
+
+    def test_a_broken_snapshot_never_stops_the_ap(self):
+        s = FakeSystem()
+        s.capture = mock.Mock(side_effect=RuntimeError("boom"))
+        self.assertEqual(ctl.cmd_start(self.cfg, s), 0)
+        self.assertTrue(self.is_ap(s), self.describe(s))
+
+    def test_an_unwritable_snapshot_folder_never_stops_the_ap(self):
+        blocker = ctl.SNAPSHOT_FILE.parent.parent / "blocker"
+        blocker.parent.mkdir(parents=True, exist_ok=True)
+        blocker.write_text("a file where a folder should be")
+        with mock.patch.object(ctl, "SNAPSHOT_FILE", blocker / "ap-snapshots.log"):
+            s = FakeSystem()
+            self.assertEqual(ctl.cmd_start(self.cfg, s), 0)
+        self.assertTrue(self.is_ap(s), self.describe(s))
+
+    def test_failing_to_schedule_the_follow_up_never_stops_the_ap(self):
+        s = FakeSystem()
+        s.fail_snapshot_timer = True
+        self.assertEqual(ctl.cmd_start(self.cfg, s), 0)
+        self.assertTrue(self.is_ap(s), self.describe(s))
+        self.assertIn("[AP up]", self.read())
+
+    def test_failover_ap_gets_a_snapshot_too(self):
+        cfg = dataclasses.replace(self.cfg, failover_grace=120, failover_join_timeout=30)
+        s = FakeSystem(connected=True, connect_after=None)
+        s.client = s.pending = None
+        s.in_range = set()                     # the hotspot really is gone
+        ctl.cmd_event(cfg, s, IFACE, "down")
+        s.fire_failover(cfg)
+        self.assertTrue(self.is_ap(s), self.describe(s))
+        self.assertIn("[AP up]", self.read())
+
+    def test_the_file_is_trimmed_instead_of_growing_forever(self):
+        ctl.SNAPSHOT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        ctl.SNAPSHOT_FILE.write_text("x" * (ctl.SNAPSHOT_MAX_BYTES + 5000))
+        ctl.cmd_snapshot(self.cfg, FakeSystem())
+        self.assertLess(ctl.SNAPSHOT_FILE.stat().st_size, ctl.SNAPSHOT_MAX_BYTES)
+        self.assertIn("[manual]", self.read())
+
+    def test_dry_run_writes_nothing(self):
+        ctl.cmd_snapshot(self.cfg, ctl.Shell(dry_run=True))
+        self.assertFalse(ctl.SNAPSHOT_FILE.exists())
+
+    def test_command_line_takes_zero_or_one_label(self):
+        args = ctl.build_parser().parse_args(["snapshot"])
+        self.assertEqual(args.event_args, [])
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            ctl.main(["snapshot", "one", "two"])
 
 
 if __name__ == "__main__":

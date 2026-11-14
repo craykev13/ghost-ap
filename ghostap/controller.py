@@ -47,6 +47,11 @@ STATE_FILE = RUN_DIR / "state.json"
 RESCUE_UNIT = "ghostap-rescue"
 FAILOVER_UNIT = "ghostap-failover"
 LOG_FILE = RUN_DIR / "ghostap.log"   # survives a dead SSH session; read it afterwards
+# Radio snapshots live on disk (not /run) so they survive the reboot that follows a bad AP.
+SNAPSHOT_FILE = Path("/var/lib/ghostap/ap-snapshots.log")
+SNAPSHOT_UNIT = "ghostap-snapshot"
+SNAPSHOT_DELAY = 90          # seconds after the AP is up for the follow-up snapshot
+SNAPSHOT_MAX_BYTES = 256 * 1024
 
 # The live-test timer is armed BEFORE the AP exists. Without headroom for startup
 # (hostapd verification alone can take 15s) the usable test window would shrink by
@@ -201,6 +206,17 @@ class Shell:
             detail = (r.stderr or r.stdout).strip()
             raise GhostAPError(f"{cmd[0]} failed ({r.returncode}): {detail}")
         return r
+
+    def capture(self, *cmd: str) -> str:
+        """Run a read-only command for a diagnostic dump. Never raises, never logs the
+        command line, and returns whatever it printed (or why it couldn't run)."""
+        if self.dry_run:
+            return ""
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+            return f"(could not run: {e})"
+        return (r.stdout + r.stderr).rstrip()
 
     def sleep(self, seconds: float) -> None:
         if not self.dry_run:
@@ -687,6 +703,72 @@ def start_ap(sh: Shell, cfg: Config) -> None:
     verify_ap(sh, cfg)
 
 
+# --------------------------------------------------------------------------
+# Radio snapshots: evidence for "why can't my phone see the AP?"
+# --------------------------------------------------------------------------
+
+def _snapshot_commands(iface: str) -> tuple[tuple[str, ...], ...]:
+    return (
+        ("iw", "dev"),
+        ("iw", "dev", iface, "station", "dump"),
+        ("iw", "dev", iface, "get", "power_save"),
+        ("iw", "reg", "get"),
+        ("hostapd_cli", "-i", iface, "status"),
+        ("pgrep", "-a", "hostapd"),
+        ("pgrep", "-a", "wpa_supplicant"),
+        ("pgrep", "-a", "dnsmasq"),
+        ("nmcli", "-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device"),
+        ("ip", "-br", "addr", "show", "dev", iface),
+        ("rfkill", "list"),
+        ("journalctl", "-k", "-n", "40", "--no-pager"),
+        ("journalctl", "-t", "hostapd", "-n", "30", "--no-pager"),
+    )
+
+
+def take_snapshot(sh: Shell, cfg: Config, label: str) -> None:
+    """Append what the radio looks like right now to SNAPSHOT_FILE. Best effort: a
+    diagnostic must never be the reason an AP fails to come up."""
+    try:
+        state = read_state() or {}
+        try:
+            uptime = float(Path("/proc/uptime").read_text().split()[0])
+        except (OSError, ValueError):
+            uptime = -1.0
+        parts = [f"===== {time.strftime('%Y-%m-%d %H:%M:%S')}  [{label}]  "
+                 f"purpose={state.get('purpose', 'none')}  uptime={uptime:.0f}s ====="]
+        for cmd in _snapshot_commands(cfg.interface):
+            parts.append(f"--- {' '.join(cmd)}")
+            parts.append(sh.capture(*cmd) or "(no output)")
+        text = "\n".join(parts) + "\n\n"
+        if sh.dry_run:
+            return
+        SNAPSHOT_FILE.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        try:
+            if SNAPSHOT_FILE.stat().st_size > SNAPSHOT_MAX_BYTES:
+                keep = SNAPSHOT_FILE.read_bytes()[-SNAPSHOT_MAX_BYTES // 2:]
+                SNAPSHOT_FILE.write_bytes(keep)
+        except FileNotFoundError:
+            pass
+        with SNAPSHOT_FILE.open("a") as f:
+            f.write(text)
+        log.info("radio snapshot '%s' saved to %s", label, SNAPSHOT_FILE)
+    except Exception as e:      # noqa: BLE001 - diagnostics are strictly best effort
+        log.warning("couldn't save a radio snapshot: %s", e)
+
+
+def arm_snapshot(sh: Shell, cfg: Config) -> None:
+    """One follow-up snapshot a little later: does the radio go bad AFTER it looks fine?"""
+    try:
+        sh.run("systemctl", "stop", f"{SNAPSHOT_UNIT}.timer", check=False)
+        sh.run("systemd-run", f"--unit={SNAPSHOT_UNIT}", f"--on-active={SNAPSHOT_DELAY}s",
+               "--timer-property=AccuracySec=1s", "--collect",
+               "--description=GhostAP follow-up snapshot", "--",
+               sys.executable, str(Path(__file__).resolve()), "snapshot",
+               f"+{SNAPSHOT_DELAY}s", "--config", str(cfg.path))
+    except GhostAPError as e:
+        log.warning("couldn't schedule the follow-up snapshot: %s", e)
+
+
 def _begin_ap(sh: Shell, cfg: Config, *, purpose: str, rescue_seconds: int,
               require_rescue: bool) -> dict:
     """The one door into AP mode. Order matters:
@@ -723,6 +805,8 @@ def _begin_ap(sh: Shell, cfg: Config, *, purpose: str, rescue_seconds: int,
         }
         write_state(sh, state)
         start_ap(sh, cfg)
+        take_snapshot(sh, cfg, "AP up")
+        arm_snapshot(sh, cfg)
         return state
     except NotStarted:
         raise
@@ -747,6 +831,14 @@ def cmd_start(cfg: Config, sh: Shell) -> int:
     _begin_ap(sh, cfg, purpose="boot", rescue_seconds=cfg.rescue_timeout,
               require_rescue=False)
     disarm_rescue(sh)  # AP verified: the safety net has done its job
+    return 0
+
+
+def cmd_snapshot(cfg: Config, sh: Shell, label: str = "manual") -> int:
+    """Save the radio's current state. Run it any time: `sudo ghostap snapshot`."""
+    take_snapshot(sh, cfg, label)
+    if not sh.dry_run:
+        log.info("read it with: sudo tail -80 %s", SNAPSHOT_FILE)
     return 0
 
 
@@ -906,7 +998,8 @@ def cmd_test_abort(cfg: Config, sh: Shell) -> int:
 
 COMMANDS = {"start": cmd_start, "stop": cmd_stop, "status": cmd_status,
             "recover": cmd_recover, "test": cmd_test_start,
-            "failover": cmd_failover, "event": cmd_event}
+            "failover": cmd_failover, "event": cmd_event,
+            "snapshot": cmd_snapshot}
 
 
 def _install_signal_handlers() -> None:
@@ -943,7 +1036,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("command", choices=COMMANDS)
     p.add_argument("event_args", nargs="*", metavar="IFACE ACTION",
-                   help="(event) interface and up/down, as passed by NetworkManager")
+                   help="(event) interface and up/down, as passed by NetworkManager; "
+                        "(snapshot) an optional label")
     p.add_argument("-c", "--config", type=Path, default=DEFAULT_CONFIG)
     p.add_argument("--dry-run", action="store_true",
                    help="show what would happen; change nothing")
@@ -961,8 +1055,10 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
     if (args.commit or args.abort) and args.command != "test":
         p.error("--commit and --abort only apply to the 'test' command")
-    if args.event_args and args.command != "event":
-        p.error("extra arguments only apply to the 'event' command")
+    if args.event_args and args.command not in ("event", "snapshot"):
+        p.error("extra arguments only apply to the 'event' and 'snapshot' commands")
+    if args.command == "snapshot" and len(args.event_args) > 1:
+        p.error("snapshot takes at most one label: ghostap snapshot [LABEL]")
     if args.command == "event" and len(args.event_args) != 2:
         p.error("event needs an interface and an action: ghostap event wlan0 down")
     if (args.expect or args.original) and args.command != "recover":
@@ -978,6 +1074,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_recover(cfg, sh, expect=args.expect, original=args.original)
         if args.command == "event":
             return cmd_event(cfg, sh, *args.event_args)
+        if args.command == "snapshot":
+            return cmd_snapshot(cfg, sh, *(args.event_args or ["manual"]))
         if args.command == "test":
             fn = cmd_test_commit if args.commit else cmd_test_abort if args.abort else cmd_test_start
         else:

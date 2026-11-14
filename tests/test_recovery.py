@@ -15,6 +15,7 @@ check the Pi ended up in one of two sane states and never a half-switched one:
     client state: radio managed, no daemons of ours, no leftover AP address
 """
 import contextlib
+import dataclasses
 import importlib.util
 import io
 import itertools
@@ -581,6 +582,33 @@ class RecoverTests(Base):
                     self.assertIsNone(s.timer)
                 covered += 1
             self.assertGreaterEqual(covered, 4, label)
+
+
+class ApDiagnosticsTests(Base):
+    """"Incorrect password" on an iPhone can mean any failed handshake. With
+    hostapd_debug on, hostapd says which step failed (journalctl -t hostapd)."""
+
+    def test_debug_logging_is_off_by_default(self):
+        self.assertNotIn("logger_syslog", ctl.render_hostapd(self.cfg))
+
+    def test_debug_logging_goes_to_the_journal_when_asked(self):
+        cfg = dataclasses.replace(self.cfg, hostapd_debug=True)
+        conf = ctl.render_hostapd(cfg)
+        self.assertIn("logger_syslog=-1", conf.splitlines())
+        self.assertIn("logger_syslog_level=0", conf.splitlines())
+
+    def test_the_switch_is_read_from_the_config_file(self):
+        d = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        (d / "pw").write_text("testpass123\n")
+        os.chmod(d / "pw", 0o600)
+        for flag, want in (("true", True), ("false", False), (None, False)):
+            extra = f"hostapd_debug = {flag}\n" if flag else ""
+            (d / "c.toml").write_text(
+                '[network]\ninterface = "wlan0"\n[access_point]\nssid = "ZeroFi"\n'
+                f'passphrase_file = "{d / "pw"}"\n{extra}'
+                '[dhcp]\nstart = "192.168.4.10"\nend = "192.168.4.50"\n')
+            self.assertEqual(ctl.load_config(d / "c.toml").hostapd_debug, want, flag)
 
 
 class BootJoinTests(Base):

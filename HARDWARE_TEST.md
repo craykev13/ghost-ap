@@ -1,8 +1,8 @@
 # GhostAP: first hardware test on ZeroFi
 
 Goal: confirm on real systemd, NetworkManager and hostapd the things the fake system can only
-assume. This installs no boot service. Keep your working `wifi-or-ap.service` until GhostAP
-replaces it, and never enable both.
+assume. Stages A to D install no boot service. Keep your working `wifi-or-ap.service` until
+GhostAP replaces it (stage E does that), and never enable both.
 
 ## Setup (once)
 ```
@@ -53,5 +53,40 @@ check as in B.6. `cat /run/ghostap/ghostap.log` shows the last thing the control
 `cat /run/ghostap/ghostap.log`, `journalctl -u ghostap-rescue -o cat --since -15min`,
 `systemctl list-timers --all | grep ghostap`, `nmcli device status`, `pgrep -a 'hostapd|dnsmasq'`
 
+## E. Boot fallback and failover (verified on ZeroFi)
+Install the boot service and the NetworkManager hook, and turn failover on:
+```
+sudo ln -sf ~/ghost-ap/ghostap/controller.py /usr/local/bin/ghostap
+sudo chmod +x ~/ghost-ap/ghostap/controller.py
+sudo cp ~/ghost-ap/systemd/ghostap.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl disable --now wifi-or-ap.service     # the old script, if present: never run both
+sudo systemctl enable ghostap.service
+sudo install -m 755 -o root -g root ~/ghost-ap/nm-dispatcher/90-ghostap /etc/NetworkManager/dispatcher.d/90-ghostap
+sudo sed -i 's/^failover_grace = .*/failover_grace = 120/' /etc/ghostap/ghostap.toml
+```
+Make logs survive reboots first (see TROUBLESHOOTING.md: Raspberry Pi OS keeps them in RAM by default).
+
+**E1. Boot fallback.** Hotspot OFF, reboot the Pi, wait 3 to 4 minutes. ZeroFi should appear; join it
+from a phone and a laptop and SSH to `192.168.4.1`. `sudo ghostap status` says `mode: AP`.
+Then hotspot ON and reboot: it should join the hotspot by itself (about 8 s after the radio is ready).
+
+**E2. Failover after boot.** Pi on the hotspot, then turn the hotspot OFF. After about 2.5 minutes
+(120 s grace + 30 s last look) ZeroFi appears. Check it is **still up 5 minutes later**, join it
+from every device you own, and run `pgrep -a hostapd` (a process must be listed).
+Every AP start also writes radio snapshots to `/var/lib/ghostap/ap-snapshots.log`: one when the AP
+comes up and one 90 s later. `sudo ghostap snapshot` takes one any time.
+```
+sudo tail -60 /var/lib/ghostap/ap-snapshots.log
+```
+To go back to the hotspot: hotspot ON and reboot (the AP never switches back by itself, on purpose).
+
+**E3. If ZeroFi doesn't show up or doesn't last.** Reboot with the hotspot ON, then:
+```
+sudo tail -120 /var/lib/ghostap/ap-snapshots.log
+sudo journalctl -b -1 --no-pager | grep -iE 'ghostap|hostapd|dnsmasq|Killing process'
+```
+(`-b -1` is the previous boot, so it needs the persistent journal.)
+
 ## Not covered yet
-Boot-time behaviour, the installer, and the `KillMode=process` service file (all arrive with the installer).
+The installer, a web GUI, and a link-health check after the AP-to-client switch.

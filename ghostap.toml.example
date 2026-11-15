@@ -1,36 +1,145 @@
 # Copy to /etc/ghostap/ghostap.toml and edit.
-# Put your AP password (8-63 characters) in the passphrase_file, NOT in here,
-# and lock it down:  sudo chmod 600 /etc/ghostap/passphrase
+# Generated from the settings list in controller.py:
+#   python3 ghostap/controller.py example-config > ghostap.toml.example
+# Lines starting with a single # are settings that are off until you remove it.
 
 [network]
+# The WiFi interface GhostAP controls.
 interface = "wlan0"
-boot_timeout = 60        # seconds to look for and join a known WiFi before starting the AP
+
+# Seconds to look for and join a known WiFi at boot before starting the AP.
+boot_timeout = 60
 
 [access_point]
+# The name of the fallback WiFi network (1-32 bytes).
 ssid = "ZeroFi"
+
+# File holding the AP password (8-63 characters), so the password itself stays
+# out of this file. Lock that file down with chmod 600.
 passphrase_file = "/etc/ghostap/passphrase"
+
+# Two-letter regulatory country code. It decides which channels and power
+# levels are legal where you are.
 country = "US"
-channel = 6              # 1-11
+
+# WiFi channel. 2.4 GHz: 1-14 (what's legal depends on country). 5 GHz
+# (hw_mode = "a"): 36-177. A quiet channel helps a lot in crowded buildings.
+channel = 6
+
+# The AP's own address and network size.
 address = "192.168.4.1/24"
-hostapd_debug = false     # true: log every handshake step (journalctl -t hostapd)
+
+# Radio band: "g" = 2.4 GHz, "a" = 5 GHz (only on hardware that has it), "b" =
+# old 2.4 GHz 802.11b.
+hw_mode = "g"
+
+# WPA version: 1, 2 or 3 (a bitmask: 1 = WPA, 2 = WPA2). Leave on 2 unless you
+# know you need otherwise.
+wpa = 2
+
+# Key management, space separated. WPA-PSK is the normal home-network mode;
+# WPA-PSK-SHA256 and SAE (WPA3) exist on newer clients. SAE also needs a
+# sae_password line in extra_hostapd.
+wpa_key_mgmt = "WPA-PSK"
+
+# Encryption cipher(s), space separated. CCMP (AES) is the safe choice. TKIP
+# is old and weak, only for ancient devices.
+rsn_pairwise = "CCMP"
+
+# Protected management frames: 0 = off, 1 = optional, 2 = required. Some
+# phones need 0 or 1 to join without trouble.
+ieee80211w = 0
+
+# Authentication algorithms: 1 = open system (what WPA uses), 2 = shared key,
+# 3 = both.
+auth_algs = 1
+
+# Turn 802.11n (faster speeds) on or off. Not set = left off, as before.
+# ieee80211n = true
+
+# WiFi multimedia (needed for 802.11n speeds on many clients).
+# wmm_enabled = true
+
+# 802.11n capability string, for example "[SHORT-GI-20]". Empty = not written.
+# ht_capab = "[SHORT-GI-20]"
+
+# Hide the network name (true) or show it (false). Not set = hostapd's default
+# (shown). Hidden networks are harder to join and not really more secure.
+# ignore_broadcast_ssid = true
+
+# Most devices allowed to join at once. 0 = don't write the line (hostapd's
+# own limit).
+# max_num_sta = 8
+
+# Time between beacon announcements, in 1.024 ms units (hostapd's default is
+# 100). 0 = don't write the line.
+# beacon_int = 100
+
+# true: log every handshake step so you can see why a device can't join
+# (journalctl -t hostapd). Chatty: turn off when you're done.
+hostapd_debug = false
+
+# Raw hostapd.conf lines, added untouched at the end. For anything not listed
+# above. Settings that have their own entry here (ssid, channel, ...) and the
+# ones GhostAP needs to supervise hostapd (interface, ctrl_interface, driver)
+# can't be set this way.
+# extra_hostapd = ["max_listen_interval=100"]
 
 [dhcp]
+# First address handed out. Must be inside the AP's network.
 start = "192.168.4.10"
+
+# Last address handed out.
 end = "192.168.4.50"
+
+# How long a device keeps its address: a number plus m, h or d (for example
+# "12h"), or "infinite".
 lease_time = "1h"
 
-# Optional. Defaults shown.
+# 0 = DHCP only (dnsmasq's DNS side stays off so it can't fight anything on
+# port 53). Set a port, such as 53, to turn DNS forwarding on.
+dns_port = 0
+
+# Gateway to tell devices about. Empty = dnsmasq's default (the AP itself). An
+# address, or "none" to hand out no gateway at all.
+# router = "none"
+
+# DNS servers to tell devices to use, for example ["1.1.1.1"]. Empty = none.
+# dns_servers = ["1.1.1.1"]
+
+# Raw dnsmasq.conf lines, added untouched at the end. For example a fixed
+# address for one device: "dhcp-host=aa:bb:cc:dd:ee:ff,192.168.4.20". The
+# lines GhostAP needs to supervise dnsmasq (interface, pid-file, ...) can't be
+# set this way.
+# extra_dnsmasq = ["dhcp-host=aa:bb:cc:dd:ee:ff,192.168.4.20"]
+
 [recovery]
-rescue_timeout = 90      # boot: if the controller dies mid-switch, systemd runs
-                         # `ghostap recover` after this many seconds (min 30)
-reconnect_timeout = 20   # after handing the radio back, wait this long for WiFi to
-                         # actually reconnect and report it honestly (min 5)
-failover_grace = 0       # 0 = off. If WiFi drops AFTER boot and stays down this many
-                         # seconds, take one last look and then raise the AP. Needs the
-                         # NetworkManager hook (nm-dispatcher/90-ghostap). Suggested: 120.
-failover_join_timeout = 30   # that last look for WiFi, in seconds (min 10)
+# Safety net: if the controller dies mid-switch, systemd runs `ghostap
+# recover` after this many seconds.
+rescue_timeout = 90
+
+# After handing the radio back, wait this long for WiFi to actually reconnect
+# and report it honestly.
+reconnect_timeout = 20
+
+# 0 = off. If WiFi drops AFTER boot and stays down this many seconds, take one
+# last look and then raise the AP. Needs the NetworkManager hook (nm-
+# dispatcher/90-ghostap). Suggested: 120.
+failover_grace = 0
+
+# That last look for WiFi before failing over.
+failover_join_timeout = 30
 
 [testing]
-live_timeout = 120       # `ghostap test` gives you AT LEAST this long once the AP is up,
-                         # then reverts by itself unless you run `ghostap test --commit`
-                         # (the timer is armed ~30s earlier to cover AP startup) (min 30)
+# `ghostap test` gives you AT LEAST this long once the AP is up, then reverts
+# by itself unless you run `ghostap test --commit`. The timer is armed ~30 s
+# earlier to cover AP startup.
+live_timeout = 120
+
+[diagnostics]
+# Save a snapshot of the radio's state whenever an AP comes up
+# (/var/lib/ghostap/ap-snapshots.log). Handy when a device can't see the AP.
+snapshots = true
+
+# Take a second snapshot this long after the AP is up, to see if it degrades.
+snapshot_delay = 90

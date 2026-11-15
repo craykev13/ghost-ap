@@ -344,6 +344,10 @@ class FakeSystem(ctl.Shell):
         args = ctl.build_parser().parse_args(timer["argv"][2:])
         assert args.command == "failover", timer["argv"]
         self.last_exit = ctl.cmd_failover(cfg, self)
+        # The service has finished. systemd now cleans up its cgroup: by default that
+        # kills every process still in it, including a daemonized hostapd and dnsmasq.
+        if "--property=KillMode=process" not in timer["cmd"]:
+            self.reap_children()
         return True
 
 
@@ -655,6 +659,20 @@ class FailoverTests(Base):
     def setUp(self):
         super().setUp()
         self.cfg = dataclasses.replace(self.cfg, failover_grace=120, failover_join_timeout=30)
+
+    def test_failover_ap_survives_the_failover_job_finishing(self):
+        """Seen on hardware: the AP came up, then vanished ~90s later. hostapd and
+        dnsmasq were started inside the transient failover service, and systemd killed
+        them when that service ended."""
+        s = self.drop(findable=False)
+        ctl.cmd_event(self.cfg, s, IFACE, "down")
+        self.assertTrue(s.fire_failover(self.cfg))
+        self.assertTrue(self.is_ap(s), self.describe(s))
+
+    def test_failover_job_is_started_with_killmode_process(self):
+        s = self.drop(findable=False)
+        ctl.cmd_event(self.cfg, s, IFACE, "down")
+        self.assertIn("--property=KillMode=process", s.failover_timer["cmd"])
 
     def drop(self, *, findable):
         """A Pi that was connected and then lost WiFi. `findable`: the network is still

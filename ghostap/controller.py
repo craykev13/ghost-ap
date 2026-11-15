@@ -500,6 +500,9 @@ def arm_failover(sh: Shell, cfg: Config) -> None:
            f"{FAILOVER_UNIT}.timer", check=False)
     sh.run("systemd-run", f"--unit={FAILOVER_UNIT}", f"--on-active={cfg.failover_grace}s",
            "--timer-property=AccuracySec=1s", "--collect",
+           # hostapd and dnsmasq daemonize but stay in this service's cgroup. Without
+           # KillMode=process, systemd kills them the moment this job exits.
+           "--property=KillMode=process",
            "--description=GhostAP failover", "--",
            sys.executable, str(Path(__file__).resolve()), "failover", "--config", str(cfg.path))
 

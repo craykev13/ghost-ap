@@ -104,6 +104,221 @@ class Config:
     hostapd_debug: bool = False       # log every handshake step to the journal
     failover_grace: int = 0           # seconds WiFi may stay down before failover; 0 = off
     failover_join_timeout: int = 30   # one last look for WiFi before raising the AP
+    # AP radio and security. Defaults reproduce the original fixed config exactly.
+    hw_mode: str = "g"
+    wpa: int = 2
+    wpa_key_mgmt: str = "WPA-PSK"
+    rsn_pairwise: str = "CCMP"
+    ieee80211w: int = 0
+    auth_algs: int = 1
+    ieee80211n: bool | None = None            # None = don't write the line at all
+    wmm_enabled: bool | None = None
+    ht_capab: str = ""
+    ignore_broadcast_ssid: bool | None = None
+    max_num_sta: int = 0                      # 0 = don't write the line
+    beacon_int: int = 0                       # 0 = don't write the line
+    extra_hostapd: tuple[str, ...] = ()
+    # DHCP
+    dns_port: int = 0                         # 0 = DHCP only (dnsmasq's DNS side off)
+    router: str = ""                          # "" = dnsmasq's default; "none" = no gateway
+    dns_servers: tuple[str, ...] = ()
+    extra_dnsmasq: tuple[str, ...] = ()
+    # Diagnostics
+    snapshots: bool = True
+    snapshot_delay: int = SNAPSHOT_DELAY
+
+
+# --------------------------------------------------------------------------
+# The settings list. ONE place that says what every setting is called, what it
+# does, what it defaults to and what it may be. Config loading, validation, the
+# example config, `ghostap schema` (for installers and GUIs) all read this list.
+# --------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Setting:
+    section: str
+    key: str
+    field: str                    # attribute on Config
+    kind: str                     # str | int | bool | ipif | secret_file | list
+    default: object
+    description: str
+    example: object = None        # shown in the example config for required/unset settings
+    minimum: int | None = None
+    maximum: int | None = None
+    zero_or_min: bool = False     # 0 means "off"; anything else must be >= minimum
+    choices: tuple | None = None  # allowed values
+    token_choices: tuple | None = None   # each space-separated word must be one of these
+    unit: str = ""
+    required: bool = False
+    advanced: bool = False
+    commented: bool = False       # in the example config, leave it commented out
+
+
+def _S(section, key, kind, default, description, field=None, **kw) -> Setting:
+    return Setting(section, key, field or key, kind, default, description, **kw)
+
+
+SETTINGS: tuple[Setting, ...] = (
+    # ---- [network] ----
+    _S("network", "interface", "str", "wlan0",
+       "The WiFi interface GhostAP controls."),
+    _S("network", "boot_timeout", "int", 60,
+       "Seconds to look for and join a known WiFi at boot before starting the AP.",
+       minimum=0, unit=" seconds"),
+    # ---- [access_point] ----
+    _S("access_point", "ssid", "str", None,
+       "The name of the fallback WiFi network (1-32 bytes).",
+       required=True, example="ZeroFi"),
+    _S("access_point", "passphrase_file", "secret_file", None,
+       "File holding the AP password (8-63 characters), so the password itself stays "
+       "out of this file. Lock that file down with chmod 600.",
+       field="passphrase", required=True, example="/etc/ghostap/passphrase"),
+    _S("access_point", "country", "str", "US",
+       "Two-letter regulatory country code. It decides which channels and power "
+       "levels are legal where you are."),
+    _S("access_point", "channel", "int", 6,
+       "WiFi channel. 2.4 GHz: 1-14 (what's legal depends on country). 5 GHz "
+       "(hw_mode = \"a\"): 36-177. A quiet channel helps a lot in crowded buildings.",
+       minimum=1, maximum=177),
+    _S("access_point", "address", "ipif", "192.168.4.1/24",
+       "The AP's own address and network size."),
+    _S("access_point", "hw_mode", "str", "g",
+       "Radio band: \"g\" = 2.4 GHz, \"a\" = 5 GHz (only on hardware that has it), "
+       "\"b\" = old 2.4 GHz 802.11b.",
+       choices=("g", "a", "b"), advanced=True),
+    _S("access_point", "wpa", "int", 2,
+       "WPA version: 1, 2 or 3 (a bitmask: 1 = WPA, 2 = WPA2). Leave on 2 unless you "
+       "know you need otherwise.",
+       choices=(1, 2, 3), advanced=True),
+    _S("access_point", "wpa_key_mgmt", "str", "WPA-PSK",
+       "Key management, space separated. WPA-PSK is the normal home-network mode; "
+       "WPA-PSK-SHA256 and SAE (WPA3) exist on newer clients. SAE also needs a "
+       "sae_password line in extra_hostapd.",
+       token_choices=("WPA-PSK", "WPA-PSK-SHA256", "SAE", "FT-PSK", "FT-SAE"),
+       advanced=True),
+    _S("access_point", "rsn_pairwise", "str", "CCMP",
+       "Encryption cipher(s), space separated. CCMP (AES) is the safe choice. TKIP is "
+       "old and weak, only for ancient devices.",
+       token_choices=("CCMP", "TKIP", "GCMP", "CCMP-256", "GCMP-256"), advanced=True),
+    _S("access_point", "ieee80211w", "int", 0,
+       "Protected management frames: 0 = off, 1 = optional, 2 = required. Some "
+       "phones need 0 or 1 to join without trouble.",
+       choices=(0, 1, 2), advanced=True),
+    _S("access_point", "auth_algs", "int", 1,
+       "Authentication algorithms: 1 = open system (what WPA uses), 2 = shared key, "
+       "3 = both.",
+       choices=(1, 2, 3), advanced=True),
+    _S("access_point", "ieee80211n", "bool", None,
+       "Turn 802.11n (faster speeds) on or off. Not set = left off, as before.",
+       example=True, commented=True, advanced=True),
+    _S("access_point", "wmm_enabled", "bool", None,
+       "WiFi multimedia (needed for 802.11n speeds on many clients).",
+       example=True, commented=True, advanced=True),
+    _S("access_point", "ht_capab", "str", "",
+       "802.11n capability string, for example \"[SHORT-GI-20]\". Empty = not written.",
+       example="[SHORT-GI-20]", commented=True, advanced=True),
+    _S("access_point", "ignore_broadcast_ssid", "bool", None,
+       "Hide the network name (true) or show it (false). Not set = hostapd's default "
+       "(shown). Hidden networks are harder to join and not really more secure.",
+       example=True, commented=True, advanced=True),
+    _S("access_point", "max_num_sta", "int", 0,
+       "Most devices allowed to join at once. 0 = don't write the line (hostapd's "
+       "own limit).",
+       minimum=0, example=8, commented=True, advanced=True),
+    _S("access_point", "beacon_int", "int", 0,
+       "Time between beacon announcements, in 1.024 ms units (hostapd's default is "
+       "100). 0 = don't write the line.",
+       minimum=0, example=100, commented=True, advanced=True),
+    _S("access_point", "hostapd_debug", "bool", False,
+       "true: log every handshake step so you can see why a device can't join "
+       "(journalctl -t hostapd). Chatty: turn off when you're done."),
+    _S("access_point", "extra_hostapd", "list", (),
+       "Raw hostapd.conf lines, added untouched at the end. For anything not listed "
+       "above. Settings that have their own entry here (ssid, channel, ...) and the "
+       "ones GhostAP needs to supervise hostapd (interface, ctrl_interface, driver) "
+       "can't be set this way.",
+       example=["max_listen_interval=100"], commented=True, advanced=True),
+    # ---- [dhcp] ----
+    _S("dhcp", "start", "str", None,
+       "First address handed out. Must be inside the AP's network.",
+       field="dhcp_start", required=True, example="192.168.4.10"),
+    _S("dhcp", "end", "str", None,
+       "Last address handed out.",
+       field="dhcp_end", required=True, example="192.168.4.50"),
+    _S("dhcp", "lease_time", "str", "1h",
+       "How long a device keeps its address: a number plus m, h or d (for example "
+       "\"12h\"), or \"infinite\"."),
+    _S("dhcp", "dns_port", "int", 0,
+       "0 = DHCP only (dnsmasq's DNS side stays off so it can't fight anything on "
+       "port 53). Set a port, such as 53, to turn DNS forwarding on.",
+       minimum=0, maximum=65535, advanced=True),
+    _S("dhcp", "router", "str", "",
+       "Gateway to tell devices about. Empty = dnsmasq's default (the AP itself). "
+       "An address, or \"none\" to hand out no gateway at all.",
+       example="none", commented=True, advanced=True, field="router"),
+    _S("dhcp", "dns_servers", "list", (),
+       "DNS servers to tell devices to use, for example [\"1.1.1.1\"]. Empty = none.",
+       example=["1.1.1.1"], commented=True, advanced=True),
+    _S("dhcp", "extra_dnsmasq", "list", (),
+       "Raw dnsmasq.conf lines, added untouched at the end. For example a fixed "
+       "address for one device: \"dhcp-host=aa:bb:cc:dd:ee:ff,192.168.4.20\". The "
+       "lines GhostAP needs to supervise dnsmasq (interface, pid-file, ...) can't be "
+       "set this way.",
+       example=["dhcp-host=aa:bb:cc:dd:ee:ff,192.168.4.20"], commented=True,
+       advanced=True),
+    # ---- [recovery] ----
+    _S("recovery", "rescue_timeout", "int", 90,
+       "Safety net: if the controller dies mid-switch, systemd runs `ghostap recover` "
+       "after this many seconds.",
+       minimum=30, unit=" seconds"),
+    _S("recovery", "reconnect_timeout", "int", 20,
+       "After handing the radio back, wait this long for WiFi to actually reconnect "
+       "and report it honestly.",
+       minimum=5, unit=" seconds"),
+    _S("recovery", "failover_grace", "int", 0,
+       "0 = off. If WiFi drops AFTER boot and stays down this many seconds, take one "
+       "last look and then raise the AP. Needs the NetworkManager hook "
+       "(nm-dispatcher/90-ghostap). Suggested: 120.",
+       minimum=15, zero_or_min=True, unit=" seconds"),
+    _S("recovery", "failover_join_timeout", "int", 30,
+       "That last look for WiFi before failing over.",
+       minimum=10, unit=" seconds"),
+    # ---- [testing] ----
+    _S("testing", "live_timeout", "int", 120,
+       "`ghostap test` gives you AT LEAST this long once the AP is up, then reverts "
+       "by itself unless you run `ghostap test --commit`. The timer is armed ~30 s "
+       "earlier to cover AP startup.",
+       minimum=30, unit=" seconds"),
+    # ---- [diagnostics] ----
+    _S("diagnostics", "snapshots", "bool", True,
+       "Save a snapshot of the radio's state whenever an AP comes up "
+       "(/var/lib/ghostap/ap-snapshots.log). Handy when a device can't see the AP."),
+    _S("diagnostics", "snapshot_delay", "int", SNAPSHOT_DELAY,
+       "Take a second snapshot this long after the AP is up, to see if it degrades.",
+       minimum=10, unit=" seconds", advanced=True),
+)
+
+_SECTION_ORDER = ("network", "access_point", "dhcp", "recovery", "testing", "diagnostics")
+_BY_SECTION: dict[str, dict[str, Setting]] = {}
+for _s in SETTINGS:
+    _BY_SECTION.setdefault(_s.section, {})[_s.key] = _s
+del _s
+
+# Settings GhostAP itself relies on to supervise the daemons. Not settable through
+# the raw "extra" lines (or through the named ones: those are fixed in code).
+_HOSTAPD_FIXED = frozenset({"interface", "ctrl_interface", "driver"})
+_DNSMASQ_FIXED = frozenset({"interface", "bind-interfaces", "pid-file", "dhcp-leasefile"})
+# Raw-line keys that have a named setting: say which one to use instead.
+_HOSTAPD_NAMED = {
+    "ssid": "ssid", "country_code": "country", "hw_mode": "hw_mode", "channel": "channel",
+    "wpa": "wpa", "wpa_passphrase": "passphrase_file", "wpa_key_mgmt": "wpa_key_mgmt",
+    "rsn_pairwise": "rsn_pairwise", "ieee80211w": "ieee80211w", "auth_algs": "auth_algs",
+    "ieee80211n": "ieee80211n", "wmm_enabled": "wmm_enabled", "ht_capab": "ht_capab",
+    "ignore_broadcast_ssid": "ignore_broadcast_ssid", "max_num_sta": "max_num_sta",
+    "beacon_int": "beacon_int", "logger_syslog": "hostapd_debug",
+    "logger_syslog_level": "hostapd_debug",
+}
+_DNSMASQ_NAMED = {"port": "dns_port"}
 
 
 def _read_secret(path: Path) -> str:
@@ -117,32 +332,111 @@ def _read_secret(path: Path) -> str:
     return text
 
 
+def _check_extra_lines(setting: str, lines, *, fixed, named, key_re: str) -> None:
+    import re
+    pattern = re.compile(key_re)
+    for line in lines:
+        if not isinstance(line, str) or not line.strip():
+            raise GhostAPError(f"{setting}: every entry must be a non-empty line of text")
+        if any(c in line for c in "\n\r\0") or len(line) > 512:
+            raise GhostAPError(f"{setting}: each entry must be ONE line (max 512 characters), "
+                               f"no line breaks: {line[:40]!r}")
+        if line.lstrip().startswith("#"):
+            continue
+        m = pattern.match(line)
+        if not m:
+            raise GhostAPError(f"{setting}: doesn't look like a config line: {line!r}")
+        key = m.group(1)
+        if key in fixed:
+            raise GhostAPError(f"{setting}: '{key}' is fixed because GhostAP uses it to "
+                               "supervise the daemon")
+        if key in named:
+            raise GhostAPError(f"{setting}: '{key}' has its own setting; use '{named[key]}'")
+
+
 def validate(cfg: Config) -> None:
+    for s in SETTINGS:
+        v = getattr(cfg, s.field)
+        if s.kind == "int":
+            if s.choices is not None and v not in s.choices:
+                raise GhostAPError(f"{s.key} must be one of {', '.join(map(str, s.choices))}")
+            if s.zero_or_min and v == 0:
+                continue
+            if s.minimum is not None and v < s.minimum:
+                what = "0 (off) or at least" if s.zero_or_min else "at least"
+                raise GhostAPError(f"{s.key} must be {what} {s.minimum}{s.unit}"
+                                   if s.minimum else f"{s.key} can't be negative")
+            if s.maximum is not None and v > s.maximum:
+                raise GhostAPError(f"{s.key} must be at most {s.maximum}{s.unit}")
+        elif s.kind == "str":
+            if s.choices is not None and v not in s.choices:
+                raise GhostAPError(f"{s.key} must be one of {', '.join(s.choices)}")
+            if s.token_choices is not None:
+                words = v.split()
+                bad = [w for w in words if w not in s.token_choices]
+                if not words or bad:
+                    raise GhostAPError(f"{s.key}: unknown value {' '.join(bad) or repr(v)!r}; "
+                                       f"use any of {', '.join(s.token_choices)}")
     if not (8 <= len(cfg.passphrase) <= 63 and cfg.passphrase.isascii()):
         raise GhostAPError("passphrase must be 8-63 ASCII characters")
     if not (1 <= len(cfg.ssid.encode()) <= 32) or "\n" in cfg.ssid:
         raise GhostAPError("ssid must be 1-32 bytes with no newlines")
-    if not 1 <= cfg.channel <= 11:
-        raise GhostAPError("channel must be 1-11 (2.4 GHz)")
-    if cfg.boot_timeout < 0:
-        raise GhostAPError("boot_timeout can't be negative")
-    # The rescue timer has to outlast a normal switch (hostapd check can take 15s).
-    if cfg.rescue_timeout < 30:
-        raise GhostAPError("rescue_timeout must be at least 30 seconds")
-    if cfg.live_timeout < 30:
-        raise GhostAPError("live_timeout must be at least 30 seconds")
-    if cfg.failover_grace and cfg.failover_grace < 15:
-        raise GhostAPError("failover_grace must be 0 (off) or at least 15 seconds")
-    if cfg.failover_join_timeout < 10:
-        raise GhostAPError("failover_join_timeout must be at least 10 seconds")
-    if cfg.reconnect_timeout < 5:
-        raise GhostAPError("reconnect_timeout must be at least 5 seconds")
+    # Which channels exist depends on the band. Whether one is LEGAL where you are is
+    # for hostapd and the country code to say; a refusal shows up as an AP that fails
+    # to start, which GhostAP rolls back from.
+    lo, hi = (36, 177) if cfg.hw_mode == "a" else (1, 14)
+    if not lo <= cfg.channel <= hi:
+        band = "5 GHz" if cfg.hw_mode == "a" else "2.4 GHz"
+        raise GhostAPError(f"channel must be {lo}-{hi} for {band} (hw_mode = \"{cfg.hw_mode}\")")
     net = cfg.address.network
     for ip in (cfg.dhcp_start, cfg.dhcp_end):
         if ipaddress.IPv4Address(ip) not in net:
             raise GhostAPError(f"DHCP address {ip} is outside {net}")
     if cfg.address.ip in (net.network_address, net.broadcast_address):
         raise GhostAPError("AP address can't be the network or broadcast address")
+    if cfg.router and cfg.router != "none":
+        ipaddress.IPv4Address(cfg.router)
+    for ip in cfg.dns_servers:
+        ipaddress.IPv4Address(ip)
+    _check_extra_lines("extra_hostapd", cfg.extra_hostapd, fixed=_HOSTAPD_FIXED,
+                       named=_HOSTAPD_NAMED, key_re=r"^\s*([A-Za-z0-9_]+(?:\[\d+\])?)=")
+    _check_extra_lines("extra_dnsmasq", cfg.extra_dnsmasq, fixed=_DNSMASQ_FIXED,
+                       named=_DNSMASQ_NAMED, key_re=r"^\s*([a-z][a-z0-9-]*)(?:=|$)")
+
+
+def _warn_if_weak(cfg: Config) -> None:
+    if "TKIP" in cfg.rsn_pairwise.split() or cfg.wpa == 1:
+        log.warning("this AP allows old, weak WiFi security (TKIP / WPA1). "
+                    "Fine for a device that needs it; not a good default")
+    if cfg.ieee80211w == 0 and "SAE" in cfg.wpa_key_mgmt.split():
+        log.warning("SAE (WPA3) normally needs ieee80211w = 1 or 2")
+
+
+def _coerce(s: Setting, value):
+    if s.kind == "str":
+        if not isinstance(value, str):
+            raise GhostAPError(f"{s.key} must be text, in quotes")
+        return value
+    if s.kind == "int":
+        try:
+            if isinstance(value, bool) or not isinstance(value, (int, str)):
+                raise ValueError
+            return int(value)
+        except ValueError:
+            raise GhostAPError(f"{s.key} must be a whole number")
+    if s.kind == "bool":
+        if not isinstance(value, bool):
+            raise GhostAPError(f"{s.key} must be true or false")
+        return value
+    if s.kind == "ipif":
+        return ipaddress.IPv4Interface(str(value))
+    if s.kind == "secret_file":
+        return _read_secret(Path(str(value)))
+    if s.kind == "list":
+        if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
+            raise GhostAPError(f"{s.key} must be a list of text lines, in quotes")
+        return tuple(value)
+    raise AssertionError(f"unknown setting kind {s.kind}")
 
 
 def load_config(path: Path) -> Config:
@@ -154,33 +448,81 @@ def load_config(path: Path) -> Config:
     except tomllib.TOMLDecodeError as e:
         raise GhostAPError(f"bad syntax in {path}: {e}")
 
+    for section, body in raw.items():
+        known = _BY_SECTION.get(section)
+        if known is None or not isinstance(body, dict):
+            log.warning("unknown section [%s] in the config; ignoring it", section)
+            continue
+        for key in body:
+            if key not in known:
+                log.warning("unknown setting '%s' in [%s]; ignoring it (typo?)", key, section)
+
+    kwargs: dict = {}
     try:
-        net, ap, dhcp = raw["network"], raw["access_point"], raw["dhcp"]
-        cfg = Config(
-            interface=net.get("interface", "wlan0"),
-            boot_timeout=int(net.get("boot_timeout", 60)),
-            ssid=ap["ssid"],
-            passphrase=_read_secret(Path(ap["passphrase_file"])),
-            country=ap.get("country", "US"),
-            channel=int(ap.get("channel", 6)),
-            address=ipaddress.IPv4Interface(ap.get("address", "192.168.4.1/24")),
-            dhcp_start=dhcp["start"],
-            dhcp_end=dhcp["end"],
-            lease_time=dhcp.get("lease_time", "1h"),
-            rescue_timeout=int(raw.get("recovery", {}).get("rescue_timeout", 90)),
-            live_timeout=int(raw.get("testing", {}).get("live_timeout", 120)),
-            path=Path(path).resolve(),
-            reconnect_timeout=int(raw.get("recovery", {}).get("reconnect_timeout", 20)),
-            hostapd_debug=bool(ap.get("hostapd_debug", False)),
-            failover_grace=int(raw.get("recovery", {}).get("failover_grace", 0)),
-            failover_join_timeout=int(raw.get("recovery", {}).get("failover_join_timeout", 30)),
-        )
+        for s in SETTINGS:
+            body = raw.get(s.section)
+            body = body if isinstance(body, dict) else {}
+            if s.key in body:
+                kwargs[s.field] = _coerce(s, body[s.key])
+            elif s.required:
+                raise GhostAPError(f"missing setting in config: '{s.key}' in [{s.section}]")
+            else:
+                kwargs[s.field] = s.default if s.kind != "ipif" else \
+                    ipaddress.IPv4Interface(s.default)
+        cfg = Config(path=Path(path).resolve(), **kwargs)
         validate(cfg)
-    except KeyError as e:
-        raise GhostAPError(f"missing setting in config: {e}")
     except ValueError as e:
         raise GhostAPError(f"invalid value in config: {e}")
+    _warn_if_weak(cfg)
     return cfg
+
+
+def settings_schema() -> list[dict]:
+    """The settings list as plain data: what an installer or GUI builds its forms from."""
+    out = []
+    for s in SETTINGS:
+        default = s.default
+        if isinstance(default, tuple):
+            default = list(default)
+        out.append({
+            "section": s.section, "key": s.key, "type": s.kind, "default": default,
+            "description": s.description, "required": s.required, "advanced": s.advanced,
+            "minimum": s.minimum, "maximum": s.maximum, "zero_means_off": s.zero_or_min,
+            "choices": list(s.choices) if s.choices else None,
+            "allowed_words": list(s.token_choices) if s.token_choices else None,
+            "unit": s.unit.strip() or None, "example": s.example,
+        })
+    return out
+
+
+def _toml_value(v) -> str:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return str(v)
+    if isinstance(v, (list, tuple)):
+        return "[" + ", ".join(_toml_value(x) for x in v) + "]"
+    return json.dumps(v)          # a JSON string is a valid TOML basic string
+
+
+def render_example_config() -> str:
+    """ghostap.toml.example, generated from the settings list so it can't drift."""
+    import textwrap
+    out = ["# Copy to /etc/ghostap/ghostap.toml and edit.",
+           "# Generated from the settings list in controller.py:",
+           "#   python3 ghostap/controller.py example-config > ghostap.toml.example",
+           "# Lines starting with a single # are settings that are off until you remove it.",
+           ""]
+    for section in _SECTION_ORDER:
+        out.append(f"[{section}]")
+        for s in (x for x in SETTINGS if x.section == section):
+            for line in textwrap.wrap(s.description, 76):
+                out.append(f"# {line}")
+            shown = s.example if (s.required or s.commented) else s.default
+            line = f"{s.key} = {_toml_value(shown)}"
+            out.append(("# " + line) if s.commented else line)
+            out.append("")
+    return "\n".join(out).rstrip() + "\n"
 
 
 # --------------------------------------------------------------------------
@@ -419,39 +761,68 @@ def wait_for_wifi(sh: Shell, cfg: Config, timeout: int | None = None) -> bool:
 # Config file generation
 # --------------------------------------------------------------------------
 
+def _flag(v: bool) -> str:
+    return "1" if v else "0"
+
+
 def render_hostapd(cfg: Config) -> str:
-    return "\n".join([
+    lines = [
         f"interface={cfg.interface}",
         "driver=nl80211",
         "ctrl_interface=/run/hostapd",
         f"ssid={cfg.ssid}",
         f"country_code={cfg.country}",
-        "hw_mode=g",
+        f"hw_mode={cfg.hw_mode}",
         f"channel={cfg.channel}",
-        "wpa=2",
+        f"wpa={cfg.wpa}",
         f"wpa_passphrase={cfg.passphrase}",
-        "wpa_key_mgmt=WPA-PSK",
-        "rsn_pairwise=CCMP",
-        "ieee80211w=0",
-        "auth_algs=1",
-        *(["# diagnostics: read with  journalctl -t hostapd",
-           "logger_syslog=-1", "logger_syslog_level=0"] if cfg.hostapd_debug else []),
-        "",
-    ])
+        f"wpa_key_mgmt={cfg.wpa_key_mgmt}",
+        f"rsn_pairwise={cfg.rsn_pairwise}",
+        f"ieee80211w={cfg.ieee80211w}",
+        f"auth_algs={cfg.auth_algs}",
+    ]
+    # Optional lines are written only when the setting is set, so the default file
+    # is the same as it always was.
+    if cfg.ieee80211n is not None:
+        lines.append(f"ieee80211n={_flag(cfg.ieee80211n)}")
+    if cfg.wmm_enabled is not None:
+        lines.append(f"wmm_enabled={_flag(cfg.wmm_enabled)}")
+    if cfg.ht_capab:
+        lines.append(f"ht_capab={cfg.ht_capab}")
+    if cfg.ignore_broadcast_ssid is not None:
+        lines.append(f"ignore_broadcast_ssid={_flag(cfg.ignore_broadcast_ssid)}")
+    if cfg.max_num_sta:
+        lines.append(f"max_num_sta={cfg.max_num_sta}")
+    if cfg.beacon_int:
+        lines.append(f"beacon_int={cfg.beacon_int}")
+    if cfg.hostapd_debug:
+        lines += ["# diagnostics: read with  journalctl -t hostapd",
+                  "logger_syslog=-1", "logger_syslog_level=0"]
+    if cfg.extra_hostapd:
+        lines += ["# extra_hostapd (your own lines)", *cfg.extra_hostapd]
+    return "\n".join([*lines, ""])
 
 
 def render_dnsmasq(cfg: Config) -> str:
-    # port=0 turns off dnsmasq's DNS side: we only need DHCP, and this avoids
+    # dns_port = 0 turns off dnsmasq's DNS side: we only need DHCP, and this avoids
     # fighting anything else for port 53.
-    return "\n".join([
+    lines = [
         f"interface={cfg.interface}",
         "bind-interfaces",
-        "port=0",
+        f"port={cfg.dns_port}",
         f"dhcp-range={cfg.dhcp_start},{cfg.dhcp_end},{cfg.lease_time}",
         f"dhcp-leasefile={RUN_DIR / 'dnsmasq.leases'}",
         f"pid-file={DNSMASQ_PID}",
-        "",
-    ])
+    ]
+    if cfg.router == "none":
+        lines.append("dhcp-option=3")
+    elif cfg.router:
+        lines.append(f"dhcp-option=3,{cfg.router}")
+    if cfg.dns_servers:
+        lines.append("dhcp-option=6," + ",".join(cfg.dns_servers))
+    if cfg.extra_dnsmasq:
+        lines += ["# extra_dnsmasq (your own lines)", *cfg.extra_dnsmasq]
+    return "\n".join([*lines, ""])
 
 
 # --------------------------------------------------------------------------
@@ -763,11 +1134,11 @@ def arm_snapshot(sh: Shell, cfg: Config) -> None:
     """One follow-up snapshot a little later: does the radio go bad AFTER it looks fine?"""
     try:
         sh.run("systemctl", "stop", f"{SNAPSHOT_UNIT}.timer", check=False)
-        sh.run("systemd-run", f"--unit={SNAPSHOT_UNIT}", f"--on-active={SNAPSHOT_DELAY}s",
+        sh.run("systemd-run", f"--unit={SNAPSHOT_UNIT}", f"--on-active={cfg.snapshot_delay}s",
                "--timer-property=AccuracySec=1s", "--collect",
                "--description=GhostAP follow-up snapshot", "--",
                sys.executable, str(Path(__file__).resolve()), "snapshot",
-               f"+{SNAPSHOT_DELAY}s", "--config", str(cfg.path))
+               f"+{cfg.snapshot_delay}s", "--config", str(cfg.path))
     except GhostAPError as e:
         log.warning("couldn't schedule the follow-up snapshot: %s", e)
 
@@ -808,8 +1179,9 @@ def _begin_ap(sh: Shell, cfg: Config, *, purpose: str, rescue_seconds: int,
         }
         write_state(sh, state)
         start_ap(sh, cfg)
-        take_snapshot(sh, cfg, "AP up")
-        arm_snapshot(sh, cfg)
+        if cfg.snapshots:
+            take_snapshot(sh, cfg, "AP up")
+            arm_snapshot(sh, cfg)
         return state
     except NotStarted:
         raise
@@ -1002,7 +1374,7 @@ def cmd_test_abort(cfg: Config, sh: Shell) -> int:
 COMMANDS = {"start": cmd_start, "stop": cmd_stop, "status": cmd_status,
             "recover": cmd_recover, "test": cmd_test_start,
             "failover": cmd_failover, "event": cmd_event,
-            "snapshot": cmd_snapshot}
+            "snapshot": cmd_snapshot, "schema": None, "example-config": None}
 
 
 def _install_signal_handlers() -> None:
@@ -1066,6 +1438,13 @@ def main(argv: list[str] | None = None) -> int:
         p.error("event needs an interface and an action: ghostap event wlan0 down")
     if (args.expect or args.original) and args.command != "recover":
         p.error("--expect and --original only apply to the 'recover' command")
+
+    if args.command in ("schema", "example-config"):
+        if args.event_args:
+            p.error(f"{args.command} takes no arguments")
+        print(json.dumps(settings_schema(), indent=2) if args.command == "schema"
+              else render_example_config(), end="" if args.command == "example-config" else "\n")
+        return 0
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     _setup_file_log(args.dry_run)

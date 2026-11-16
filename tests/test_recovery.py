@@ -19,6 +19,7 @@ import dataclasses
 import importlib.util
 import io
 import itertools
+import json
 import logging
 import os
 import pathlib
@@ -49,6 +50,10 @@ ctl = _load_controller()
 if not os.environ.get("GHOSTAP_TEST_LOG"):
     logging.disable(logging.CRITICAL)          # set GHOSTAP_TEST_LOG=1 to see controller logs
 IFACE = "wlan0"
+
+
+def ipaddress_if(text):
+    return ctl.ipaddress.IPv4Interface(text)
 ORIGINAL = "PhoneHotspot"
 
 
@@ -1511,6 +1516,287 @@ class SnapshotTests(Base):
         self.assertEqual(args.event_args, [])
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             ctl.main(["snapshot", "one", "two"])
+
+
+class SettingsTests(Base):
+    """Nothing about the AP is fixed in code any more: every value is a setting with a
+    default, and the defaults write exactly the files the Pi has always been given."""
+
+    GOLDEN_HOSTAPD = 'interface=wlan0\ndriver=nl80211\nctrl_interface=/run/hostapd\nssid=ZeroFi\ncountry_code=US\nhw_mode=g\nchannel=6\nwpa=2\nwpa_passphrase=testpass123\nwpa_key_mgmt=WPA-PSK\nrsn_pairwise=CCMP\nieee80211w=0\nauth_algs=1\n'
+    GOLDEN_HOSTAPD_DEBUG = 'interface=wlan0\ndriver=nl80211\nctrl_interface=/run/hostapd\nssid=ZeroFi\ncountry_code=US\nhw_mode=g\nchannel=6\nwpa=2\nwpa_passphrase=testpass123\nwpa_key_mgmt=WPA-PSK\nrsn_pairwise=CCMP\nieee80211w=0\nauth_algs=1\n# diagnostics: read with  journalctl -t hostapd\nlogger_syslog=-1\nlogger_syslog_level=0\n'
+    GOLDEN_DNSMASQ = 'interface=wlan0\nbind-interfaces\nport=0\ndhcp-range=192.168.4.10,192.168.4.50,1h\ndhcp-leasefile=/run/ghostap/dnsmasq.leases\npid-file=/run/ghostap/dnsmasq.pid\n'
+
+    @staticmethod
+    @contextlib.contextmanager
+    def logs_enabled():
+        previous = logging.root.manager.disable
+        logging.disable(logging.NOTSET)
+        try:
+            yield
+        finally:
+            logging.disable(previous)
+
+    def golden_dnsmasq(self):
+        # the suite points RUN_DIR at a temp folder; on the Pi it is /run/ghostap
+        return self.GOLDEN_DNSMASQ.replace("/run/ghostap", str(ctl.RUN_DIR))
+
+    def cfg_with(self, **kw):
+        return dataclasses.replace(self.cfg, **kw)
+
+    def write_config(self, body=""):
+        d = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        (d / "pw").write_text("testpass123\n")
+        os.chmod(d / "pw", 0o600)
+        (d / "c.toml").write_text(
+            f'[access_point]\nssid = "ZeroFi"\npassphrase_file = "{d / "pw"}"\n'
+            '[dhcp]\nstart = "192.168.4.10"\nend = "192.168.4.50"\n' + body)
+        return d / "c.toml"
+
+    # ---- defaults change nothing -------------------------------------------
+    def test_default_files_are_byte_for_byte_what_they_always_were(self):
+        self.assertEqual(ctl.render_hostapd(self.cfg), self.GOLDEN_HOSTAPD)
+        self.assertEqual(ctl.render_hostapd(self.cfg_with(hostapd_debug=True)),
+                         self.GOLDEN_HOSTAPD_DEBUG)
+        self.assertEqual(ctl.render_dnsmasq(self.cfg), self.golden_dnsmasq())
+
+    def test_a_minimal_config_loads_every_default_from_the_settings_list(self):
+        cfg = ctl.load_config(self.write_config())
+        for s in ctl.SETTINGS:
+            if s.required:
+                continue
+            want = ipaddress_if(s.default) if s.kind == "ipif" else s.default
+            self.assertEqual(getattr(cfg, s.field), want, s.key)
+
+    def test_loaded_defaults_render_the_original_files(self):
+        cfg = ctl.load_config(self.write_config())
+        self.assertEqual(ctl.render_hostapd(cfg).replace("testpass123", "testpass123"),
+                         self.GOLDEN_HOSTAPD)
+        self.assertEqual(ctl.render_dnsmasq(cfg), self.golden_dnsmasq())
+
+    def test_the_network_section_is_optional(self):
+        self.assertEqual(ctl.load_config(self.write_config()).interface, "wlan0")
+
+    # ---- the settings list and the code agree ------------------------------
+    def test_every_config_field_has_a_setting_and_the_reverse(self):
+        fields = {f.name for f in dataclasses.fields(ctl.Config)} - {"path"}
+        self.assertEqual(fields, {s.field for s in ctl.SETTINGS})
+
+    def test_defaults_in_the_list_match_the_dataclass_defaults(self):
+        defaults = {f.name: f.default for f in dataclasses.fields(ctl.Config)
+                    if f.default is not dataclasses.MISSING}
+        for s in ctl.SETTINGS:
+            if s.field in defaults:
+                self.assertEqual(defaults[s.field], s.default, s.key)
+
+    def test_the_schema_command_prints_the_list_as_json(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(ctl.main(["schema"]), 0)
+        data = json.loads(out.getvalue())
+        self.assertEqual([(d["section"], d["key"]) for d in data],
+                         [(s.section, s.key) for s in ctl.SETTINGS])
+        for d in data:
+            self.assertTrue(d["description"], d["key"])
+            self.assertIn(d["type"], ("str", "int", "bool", "ipif", "secret_file", "list"))
+
+    def test_the_committed_example_config_is_the_generated_one(self):
+        committed = (HERE.parent / "ghostap.toml.example").read_text()
+        self.assertEqual(committed, ctl.render_example_config(),
+                         "regenerate: python3 ghostap/controller.py example-config > ghostap.toml.example")
+
+    def test_the_example_config_loads_and_documents_every_setting(self):
+        text = ctl.render_example_config()
+        d = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        (d / "pw").write_text("testpass123")
+        os.chmod(d / "pw", 0o600)
+        (d / "c.toml").write_text(text.replace("/etc/ghostap/passphrase", str(d / "pw")))
+        ctl.load_config(d / "c.toml")
+        for s in ctl.SETTINGS:
+            self.assertIn(f"{s.key} = ", text, s.key)
+
+    # ---- the optional hostapd lines ----------------------------------------
+    def test_optional_hostapd_lines_appear_only_when_set(self):
+        out = ctl.render_hostapd(self.cfg_with(
+            ieee80211n=True, wmm_enabled=False, ht_capab="[SHORT-GI-20]",
+            ignore_broadcast_ssid=True, max_num_sta=8, beacon_int=100)).splitlines()
+        for line in ("ieee80211n=1", "wmm_enabled=0", "ht_capab=[SHORT-GI-20]",
+                     "ignore_broadcast_ssid=1", "max_num_sta=8", "beacon_int=100"):
+            self.assertIn(line, out)
+        self.assertLess(out.index("auth_algs=1"), out.index("ieee80211n=1"))
+
+    def test_the_security_settings_reach_the_file(self):
+        out = ctl.render_hostapd(self.cfg_with(
+            wpa=3, wpa_key_mgmt="WPA-PSK SAE", rsn_pairwise="CCMP GCMP",
+            ieee80211w=2, auth_algs=3, hw_mode="a", channel=36)).splitlines()
+        for line in ("wpa=3", "wpa_key_mgmt=WPA-PSK SAE", "rsn_pairwise=CCMP GCMP",
+                     "ieee80211w=2", "auth_algs=3", "hw_mode=a", "channel=36"):
+            self.assertIn(line, out)
+
+    # ---- limits ---------------------------------------------------------------
+    def test_channels_follow_the_band(self):
+        ok = [dict(hw_mode="g", channel=14), dict(hw_mode="a", channel=36),
+              dict(hw_mode="a", channel=165), dict(hw_mode="g", channel=1)]
+        bad = [dict(hw_mode="g", channel=15), dict(hw_mode="g", channel=0),
+               dict(hw_mode="a", channel=6), dict(hw_mode="a", channel=178)]
+        for kw in ok:
+            ctl.validate(self.cfg_with(**kw))
+        for kw in bad:
+            with self.assertRaises(ctl.GhostAPError, msg=str(kw)):
+                ctl.validate(self.cfg_with(**kw))
+
+    def test_values_outside_the_allowed_choices_are_refused(self):
+        for kw in (dict(hw_mode="x"), dict(wpa=4), dict(ieee80211w=3), dict(auth_algs=0),
+                   dict(rsn_pairwise="CCMP FOO"), dict(wpa_key_mgmt=""), dict(max_num_sta=-1),
+                   dict(dns_port=70000), dict(snapshot_delay=1)):
+            with self.assertRaises(ctl.GhostAPError, msg=str(kw)):
+                ctl.validate(self.cfg_with(**kw))
+
+    def test_the_old_numeric_limits_still_hold(self):
+        for kw in (dict(rescue_timeout=29), dict(live_timeout=29), dict(boot_timeout=-1),
+                   dict(failover_grace=14), dict(failover_join_timeout=9),
+                   dict(reconnect_timeout=4)):
+            with self.assertRaises(ctl.GhostAPError, msg=str(kw)):
+                ctl.validate(self.cfg_with(**kw))
+        for kw in (dict(failover_grace=0), dict(failover_grace=15), dict(boot_timeout=0)):
+            ctl.validate(self.cfg_with(**kw))
+
+    # ---- the raw lines (the escape hatch) -------------------------------------
+    def test_extra_lines_are_written_untouched_at_the_end(self):
+        out = ctl.render_hostapd(self.cfg_with(
+            hostapd_debug=True, extra_hostapd=("max_listen_interval=100", "# note")))
+        self.assertTrue(out.rstrip("\n").endswith("max_listen_interval=100\n# note".rstrip()))
+        self.assertLess(out.index("logger_syslog=-1"), out.index("max_listen_interval=100"))
+        out = ctl.render_dnsmasq(self.cfg_with(
+            extra_dnsmasq=("dhcp-host=aa:bb:cc:dd:ee:ff,192.168.4.20",)))
+        self.assertIn("dhcp-host=aa:bb:cc:dd:ee:ff,192.168.4.20", out.splitlines())
+
+    def test_raw_lines_may_not_break_out_of_their_line(self):
+        for bad in ("a=1\nssid=evil", "a=1\rb=2", "a=1\0", "x" * 600 + "=1"):
+            for field in ("extra_hostapd", "extra_dnsmasq"):
+                with self.assertRaises(ctl.GhostAPError, msg=f"{field} {bad[:20]!r}"):
+                    ctl.validate(self.cfg_with(**{field: (bad,)}))
+        for bad in ("", "   ", "not a config line", "=value"):
+            with self.assertRaises(ctl.GhostAPError, msg=repr(bad)):
+                ctl.validate(self.cfg_with(extra_hostapd=(bad,)))
+
+    def test_raw_lines_cannot_touch_what_ghostap_supervises(self):
+        for key in ("interface=wlan1", "ctrl_interface=/tmp/x", "driver=wired"):
+            with self.assertRaises(ctl.GhostAPError, msg=key):
+                ctl.validate(self.cfg_with(extra_hostapd=(key,)))
+        for key in ("interface=eth0", "pid-file=/tmp/x", "dhcp-leasefile=/tmp/y", "bind-interfaces"):
+            with self.assertRaises(ctl.GhostAPError, msg=key):
+                ctl.validate(self.cfg_with(extra_dnsmasq=(key,)))
+
+    def test_raw_lines_point_to_the_named_setting_when_there_is_one(self):
+        with self.assertRaises(ctl.GhostAPError) as cm:
+            ctl.validate(self.cfg_with(extra_hostapd=("channel=1",)))
+        self.assertIn("channel", str(cm.exception))
+        with self.assertRaises(ctl.GhostAPError) as cm:
+            ctl.validate(self.cfg_with(extra_dnsmasq=("port=53",)))
+        self.assertIn("dns_port", str(cm.exception))
+
+    # ---- DHCP ------------------------------------------------------------------
+    def test_dhcp_options(self):
+        self.assertIn("dhcp-option=3", ctl.render_dnsmasq(self.cfg_with(router="none")).splitlines())
+        self.assertIn("dhcp-option=3,192.168.4.9",
+                      ctl.render_dnsmasq(self.cfg_with(router="192.168.4.9")).splitlines())
+        self.assertIn("dhcp-option=6,1.1.1.1,9.9.9.9",
+                      ctl.render_dnsmasq(self.cfg_with(dns_servers=("1.1.1.1", "9.9.9.9"))).splitlines())
+        self.assertIn("port=53", ctl.render_dnsmasq(self.cfg_with(dns_port=53)).splitlines())
+        for kw in (dict(router="nope"), dict(dns_servers=("1.1.1",))):
+            with self.assertRaises((ctl.GhostAPError, ValueError), msg=str(kw)):
+                ctl.validate(self.cfg_with(**kw))
+
+    # ---- loading ----------------------------------------------------------------
+    def test_every_new_setting_can_be_set_from_the_file(self):
+        d = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        (d / "pw").write_text("testpass123")
+        os.chmod(d / "pw", 0o600)
+        (d / "c.toml").write_text(f"""[access_point]
+ssid = "Other"
+passphrase_file = "{d / 'pw'}"
+hw_mode = "g"
+channel = 11
+wpa_key_mgmt = "WPA-PSK WPA-PSK-SHA256"
+ieee80211n = true
+extra_hostapd = ["max_listen_interval=100"]
+[dhcp]
+start = "192.168.4.10"
+end = "192.168.4.50"
+router = "none"
+dns_servers = ["1.1.1.1"]
+extra_dnsmasq = ["dhcp-host=aa:bb:cc:dd:ee:ff,192.168.4.20"]
+[diagnostics]
+snapshots = false
+snapshot_delay = 30
+""")
+        cfg = ctl.load_config(d / "c.toml")
+        self.assertEqual((cfg.ssid, cfg.channel, cfg.ieee80211n, cfg.router, cfg.snapshots,
+                          cfg.snapshot_delay), ("Other", 11, True, "none", False, 30))
+        self.assertEqual(cfg.extra_hostapd, ("max_listen_interval=100",))
+        self.assertIn("ieee80211n=1", ctl.render_hostapd(cfg))
+
+    def test_typos_in_the_config_are_called_out_not_silently_ignored(self):
+        cfg_path = self.write_config('[recovery]\nrescue_timout = 90\n[nonsense]\nx = 1\n')
+        with self.logs_enabled(), self.assertLogs(ctl.log, level="WARNING") as cm:
+            ctl.load_config(cfg_path)
+        text = "\n".join(cm.output)
+        self.assertIn("rescue_timout", text)
+        self.assertIn("[nonsense]", text)
+
+    def test_a_missing_required_setting_names_it(self):
+        d = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        (d / "c.toml").write_text('[access_point]\nssid = "x"\n[dhcp]\nstart = "192.168.4.10"\nend = "192.168.4.50"\n')
+        with self.assertRaises(ctl.GhostAPError) as cm:
+            ctl.load_config(d / "c.toml")
+        self.assertIn("passphrase_file", str(cm.exception))
+
+    def test_wrong_types_are_refused_with_a_clear_message(self):
+        d = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        (d / "pw").write_text("testpass123")
+        os.chmod(d / "pw", 0o600)
+        cases = (
+            ('hostapd_debug = "yes"', "", "hostapd_debug"),
+            ('channel = "six"', "", "channel"),
+            ('extra_hostapd = "a=1"', "", "extra_hostapd"),
+            ("", "[recovery]\nrescue_timeout = true", "rescue_timeout"),
+        )
+        for ap_line, tail, word in cases:
+            (d / "c.toml").write_text(
+                f'[access_point]\nssid = "ZeroFi"\npassphrase_file = "{d / "pw"}"\n{ap_line}\n'
+                f'[dhcp]\nstart = "192.168.4.10"\nend = "192.168.4.50"\n{tail}\n')
+            with self.assertRaises(ctl.GhostAPError, msg=word) as cm:
+                ctl.load_config(d / "c.toml")
+            self.assertIn(word, str(cm.exception))
+
+    def test_weak_security_is_allowed_but_flagged(self):
+        cfg_path = self.write_config('')
+        cfg = ctl.load_config(cfg_path)
+        with self.logs_enabled(), self.assertLogs(ctl.log, level="WARNING") as cm:
+            ctl._warn_if_weak(dataclasses.replace(cfg, rsn_pairwise="CCMP TKIP"))
+        self.assertIn("weak", "\n".join(cm.output))
+
+    # ---- diagnostics follow the settings ----------------------------------------
+    def test_snapshots_can_be_turned_off(self):
+        cfg = self.cfg_with(snapshots=False)
+        s = FakeSystem()
+        ctl.cmd_start(cfg, s)
+        self.assertTrue(self.is_ap(s), self.describe(s))
+        self.assertFalse(ctl.SNAPSHOT_FILE.exists())
+        self.assertNotIn("ghostap-snapshot", s.timers)
+
+    def test_the_follow_up_snapshot_delay_is_a_setting(self):
+        cfg = self.cfg_with(snapshot_delay=30)
+        s = FakeSystem()
+        ctl.cmd_start(cfg, s)
+        timer = s.timers["ghostap-snapshot"]
+        self.assertEqual(timer["secs"], 30)
+        self.assertEqual(timer["argv"][3], "+30s")
 
 
 if __name__ == "__main__":

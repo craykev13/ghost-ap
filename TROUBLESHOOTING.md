@@ -53,3 +53,23 @@ until the Pi is power-cycled. Rebooting is the reliable way back to client mode.
 | hostapd handshake steps | `journalctl -t hostapd` (needs `hostapd_debug = true`) |
 | Failover job | `journalctl -u ghostap-failover` |
 | Current mode and timers | `sudo ghostap status` |
+
+## "Will this work on my system?" — `ghostap preflight`
+
+```
+ghostap preflight
+```
+
+Looks at the machine (board, OS, whether NetworkManager is running, whether the WiFi
+chip can act as an access point, whether hostapd/dnsmasq are installed, leftover
+hotspot profiles, WiFi country) and prints what's in the way, with a fix for each:
+
+- `[X]` blocks it. GhostAP can't work until this is fixed.
+- `[!]` warning. It will probably work, but this is a known cause of trouble.
+- `[i]` just a note.
+
+It needs no config file and no root. It's a best-effort look, not a guarantee: it can
+only vouch for setups it knows about (right now: NetworkManager, i.e. Raspberry Pi OS
+Bookworm and newer). Exit code is 1 only when something blocks it.
+
+`ghostap status` also no longer needs `sudo`: it doesn't read the password file.

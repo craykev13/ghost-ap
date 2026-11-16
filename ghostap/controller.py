@@ -34,7 +34,7 @@ import subprocess
 import sys
 import time
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 DEFAULT_CONFIG = Path("/etc/ghostap/ghostap.toml")
@@ -321,6 +321,18 @@ _HOSTAPD_NAMED = {
 _DNSMASQ_NAMED = {"port": "dns_port"}
 
 
+# Stands in for the passphrase when a read-only command (status, preflight) loads the
+# config: those never touch the password, so they shouldn't need root to read it.
+_UNREAD_SECRET = "(not read)"
+
+
+def _real_passphrase(cfg) -> str:
+    if cfg.passphrase == _UNREAD_SECRET:
+        raise GhostAPError("internal error: tried to build an AP from a config loaded "
+                           "without its passphrase")
+    return cfg.passphrase
+
+
 def _read_secret(path: Path) -> str:
     try:
         mode = path.stat().st_mode
@@ -412,7 +424,7 @@ def _warn_if_weak(cfg: Config) -> None:
         log.warning("SAE (WPA3) normally needs ieee80211w = 1 or 2")
 
 
-def _coerce(s: Setting, value):
+def _coerce(s: Setting, value, secrets: bool = True):
     if s.kind == "str":
         if not isinstance(value, str):
             raise GhostAPError(f"{s.key} must be text, in quotes")
@@ -431,6 +443,8 @@ def _coerce(s: Setting, value):
     if s.kind == "ipif":
         return ipaddress.IPv4Interface(str(value))
     if s.kind == "secret_file":
+        if not secrets:
+            return _UNREAD_SECRET       # read-only commands never need the password
         return _read_secret(Path(str(value)))
     if s.kind == "list":
         if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
@@ -439,7 +453,7 @@ def _coerce(s: Setting, value):
     raise AssertionError(f"unknown setting kind {s.kind}")
 
 
-def load_config(path: Path) -> Config:
+def load_config(path: Path, secrets: bool = True) -> Config:
     try:
         with open(path, "rb") as f:
             raw = tomllib.load(f)
@@ -463,7 +477,7 @@ def load_config(path: Path) -> Config:
             body = raw.get(s.section)
             body = body if isinstance(body, dict) else {}
             if s.key in body:
-                kwargs[s.field] = _coerce(s, body[s.key])
+                kwargs[s.field] = _coerce(s, body[s.key], secrets)
             elif s.required:
                 raise GhostAPError(f"missing setting in config: '{s.key}' in [{s.section}]")
             else:
@@ -559,6 +573,23 @@ class Shell:
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
             return f"(could not run: {e})"
         return (r.stdout + r.stderr).rstrip()
+
+    def probe(self, *cmd: str) -> tuple[int, str]:
+        """Silent read-only look at the machine: (exit code, output). Never raises."""
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return 127, ""
+        return r.returncode, (r.stdout + r.stderr).strip()
+
+    def read_text(self, path: str):
+        try:
+            return Path(path).read_text(errors="replace")
+        except OSError:
+            return None
+
+    def which(self, name: str):
+        return shutil.which(name)
 
     def sleep(self, seconds: float) -> None:
         if not self.dry_run:
@@ -775,7 +806,7 @@ def render_hostapd(cfg: Config) -> str:
         f"hw_mode={cfg.hw_mode}",
         f"channel={cfg.channel}",
         f"wpa={cfg.wpa}",
-        f"wpa_passphrase={cfg.passphrase}",
+        f"wpa_passphrase={_real_passphrase(cfg)}",
         f"wpa_key_mgmt={cfg.wpa_key_mgmt}",
         f"rsn_pairwise={cfg.rsn_pairwise}",
         f"ieee80211w={cfg.ieee80211w}",
@@ -1371,10 +1402,214 @@ def cmd_test_abort(cfg: Config, sh: Shell) -> int:
     return _report_restore(_unwind(sh, cfg, wait=True), "live test aborted", cfg)
 
 
+# ---- preflight: "will this work on THIS machine?" ----------------------------------
+# Two halves on purpose. gather_facts() looks at the real machine and does nothing else;
+# judge() turns those facts into a verdict and touches nothing. Tests feed judge() whole
+# made-up machines (a Pi on dhcpcd, a WiFi chip with no AP mode, ...), which is how we
+# know it gives the right answer without owning every kind of Pi.
+
+OK, INFO, WARN, BLOCK = "ok", "info", "warn", "block"
+
+
+@dataclass
+class Finding:
+    level: str          # INFO, WARN or BLOCK
+    title: str
+    detail: str = ""
+    fix: str = ""
+
+
+@dataclass
+class HostFacts:
+    iface: str = "wlan0"
+    model: str = ""
+    os_name: str = ""
+    has_systemd: bool = True
+    tools: dict = field(default_factory=dict)       # name -> found?
+    active: dict = field(default_factory=dict)      # service -> is-active text
+    enabled: dict = field(default_factory=dict)     # service -> is-enabled text
+    iface_exists: bool = True
+    ap_mode: object = None          # True / False / None = couldn't tell
+    reg_country: object = None      # "US", "00" (unset) or None = couldn't tell
+    wifi_profiles: object = None    # saved client WiFi profiles, None = couldn't tell
+    ap_profiles: tuple = ()         # NetworkManager profiles that are hotspots
+
+
+_STACK_SERVICES = ("NetworkManager", "dhcpcd", "systemd-networkd", "wpa_supplicant")
+_TOOLS = ("hostapd", "dnsmasq", "iw", "nmcli", "systemd-run", "ip")
+
+
+def _ap_supported(iw_list: str):
+    """True/False from `iw list`'s 'Supported interface modes' block; None if no such block."""
+    lines = iw_list.splitlines()
+    for i, line in enumerate(lines):
+        if "Supported interface modes" in line:
+            modes = []
+            for nxt in lines[i + 1:]:
+                if not nxt.strip().startswith("*"):
+                    break
+                modes.append(nxt.strip().lstrip("* ").strip())
+            return "AP" in modes
+    return None
+
+
+def gather_facts(sh: Shell, iface: str = "wlan0") -> HostFacts:
+    f = HostFacts(iface=iface)
+    model = sh.read_text("/proc/device-tree/model")
+    f.model = (model or "").replace("\0", "").strip()
+    for line in (sh.read_text("/etc/os-release") or "").splitlines():
+        if line.startswith("PRETTY_NAME="):
+            f.os_name = line.split("=", 1)[1].strip().strip('"')
+    f.has_systemd = sh.probe("test", "-d", "/run/systemd/system")[0] == 0
+    f.tools = {t: sh.which(t) is not None for t in _TOOLS}
+    for svc in (*_STACK_SERVICES, "hostapd", "dnsmasq"):
+        f.active[svc] = sh.probe("systemctl", "is-active", svc)[1].split("\n")[0] or "unknown"
+    for svc in ("hostapd", "dnsmasq"):
+        f.enabled[svc] = sh.probe("systemctl", "is-enabled", svc)[1].split("\n")[0] or "unknown"
+    f.iface_exists = sh.probe("ip", "link", "show", iface)[0] == 0
+    rc, out = sh.probe("iw", "list")
+    f.ap_mode = _ap_supported(out) if rc == 0 else None
+    rc, out = sh.probe("iw", "reg", "get")
+    if rc == 0:
+        import re
+        m = re.search(r"country (\w\w):", out)
+        f.reg_country = m.group(1) if m else None
+    if f.active.get("NetworkManager") == "active" and f.tools.get("nmcli"):
+        rc, out = sh.probe("nmcli", "-t", "-f", "NAME,TYPE", "connection", "show")
+        if rc == 0:
+            client, hot = 0, []
+            for line in out.splitlines():
+                name, _, kind = line.rpartition(":")
+                if kind != "802-11-wireless":
+                    continue
+                name = name.replace("\\:", ":")
+                mode = sh.probe("nmcli", "-g", "802-11-wireless.mode",
+                                "connection", "show", name)[1]
+                if mode == "ap":
+                    hot.append(name)
+                else:
+                    client += 1
+            f.wifi_profiles, f.ap_profiles = client, tuple(hot)
+    return f
+
+
+def judge(f: HostFacts) -> list:
+    out: list = []
+    add = lambda *a, **k: out.append(Finding(*a, **k))
+    active = lambda svc: f.active.get(svc) == "active"
+
+    if not f.has_systemd:
+        add(BLOCK, "systemd isn't running",
+            "GhostAP's safety net (the self-reverting rescue timer) is a systemd timer.")
+    nm = active("NetworkManager")
+    if not nm:
+        others = [n for n in ("dhcpcd", "systemd-networkd") if active(n)]
+        if others:
+            add(BLOCK, f"This system manages WiFi with {' / '.join(others)}, not NetworkManager",
+                "GhostAP can't drive that yet. Other network setups are planned.",
+                "Switch to NetworkManager (Raspberry Pi OS Bookworm and newer use it by "
+                "default), or wait for support.")
+        else:
+            add(BLOCK, "NetworkManager isn't running",
+                "GhostAP uses it to join saved WiFi and to hand the radio over to the AP.",
+                "sudo apt install network-manager && sudo systemctl enable --now NetworkManager")
+    elif not f.tools.get("nmcli", True):
+        add(BLOCK, "nmcli (NetworkManager's command-line tool) is missing", "",
+            "sudo apt install network-manager")
+
+    for tool, pkg in (("hostapd", "hostapd"), ("dnsmasq", "dnsmasq-base"), ("iw", "iw")):
+        if not f.tools.get(tool, True):
+            add(BLOCK, f"{tool} isn't installed", "", f"sudo apt install {pkg}")
+    for tool in ("systemd-run", "ip"):
+        if not f.tools.get(tool, True):
+            add(BLOCK, f"{tool} isn't installed", "GhostAP needs it.")
+
+    if not f.iface_exists:
+        add(BLOCK, f"No WiFi interface named {f.iface}",
+            "Either this machine has no WiFi chip, or it's named differently.",
+            "Check `ip link`, then set `interface` under [network] in the config.")
+    elif f.ap_mode is False:
+        add(BLOCK, "This WiFi chip can't run as an access point",
+            "Its driver doesn't list AP mode, so hostapd can't use it.",
+            "Use a USB WiFi adapter that supports AP mode.")
+    elif f.ap_mode is None:
+        add(WARN, "Couldn't confirm the WiFi chip supports AP mode",
+            "`iw list` gave no answer here. The Pi Zero W's chip is known to work.")
+
+    if f.reg_country in (None, "00") and f.iface_exists:
+        add(WARN, "WiFi country isn't set",
+            "Without it, some channels are blocked and the radio may refuse to start an AP.",
+            "sudo raspi-config  (Localisation > WLAN Country), or: sudo iw reg set US")
+
+    for svc in ("hostapd", "dnsmasq"):
+        if active(svc) or f.enabled.get(svc) == "enabled":
+            add(WARN, f"The system {svc} service is running or enabled",
+                f"GhostAP starts its own {svc}; a second one fights over the radio and "
+                "the DHCP ports.", f"sudo systemctl disable --now {svc}")
+
+    if f.ap_profiles:
+        names = ", ".join(f.ap_profiles)
+        add(WARN, f"A leftover NetworkManager hotspot profile exists: {names}",
+            "NetworkManager may bring it up on its own and fight GhostAP's AP. This is what "
+            "broke the first failover tests.",
+            "sudo nmcli connection delete '<name>'   (if you don't use it)")
+    if f.wifi_profiles == 0:
+        add(INFO, "No saved WiFi networks",
+            "There's nothing to join, so the AP will come up at every boot.")
+
+    if "Raspberry Pi" not in f.model:
+        add(INFO, f"This doesn't look like a Raspberry Pi ({f.model or 'board unknown'})",
+            "GhostAP has only been tried on Raspberry Pis; most of it should still work.")
+    elif "Zero" in f.model:
+        add(INFO, "Pi Zero: 2.4 GHz only",
+            "Keep hw_mode = \"g\" and a channel from 1-11 (the default).")
+    return out
+
+
+def verdict(findings: list) -> str:
+    levels = {x.level for x in findings}
+    return BLOCK if BLOCK in levels else WARN if WARN in levels else OK
+
+
+_VERDICT_TEXT = {
+    OK: "Looks compatible. Nothing in the way that we know of.",
+    WARN: "Probably fine, but fix the warnings above first.",
+    BLOCK: "Not supported on this machine as it is. See the problems above.",
+}
+_MARK = {BLOCK: "[X]", WARN: "[!]", INFO: "[i]"}
+
+
+def render_preflight(f: HostFacts, findings: list) -> str:
+    lines = [f"Checked: {f.model or 'unknown board'} / {f.os_name or 'unknown OS'} "
+             f"(interface {f.iface})", ""]
+    order = {BLOCK: 0, WARN: 1, INFO: 2}
+    for x in sorted(findings, key=lambda x: order[x.level]):
+        lines.append(f"{_MARK[x.level]} {x.title}")
+        if x.detail:
+            lines.append(f"      {x.detail}")
+        if x.fix:
+            lines.append(f"      Fix: {x.fix}")
+    if findings:
+        lines.append("")
+    lines.append(_VERDICT_TEXT[verdict(findings)])
+    lines.append("This is a best-effort look at your system, not a guarantee.")
+    return "\n".join(lines)
+
+
+def cmd_preflight(cfg: Config, sh: Shell) -> int:
+    facts = gather_facts(sh, cfg.interface if cfg else "wlan0")
+    findings = judge(facts)
+    print(render_preflight(facts, findings))
+    return 1 if verdict(findings) == BLOCK else 0
+
+
+# Commands that only look, so they don't read the passphrase file (and don't need root to).
+READ_ONLY = ("status", "preflight")
+
 COMMANDS = {"start": cmd_start, "stop": cmd_stop, "status": cmd_status,
             "recover": cmd_recover, "test": cmd_test_start,
             "failover": cmd_failover, "event": cmd_event,
-            "snapshot": cmd_snapshot, "schema": None, "example-config": None}
+            "snapshot": cmd_snapshot, "preflight": cmd_preflight, "schema": None, "example-config": None}
 
 
 def _install_signal_handlers() -> None:
@@ -1450,7 +1685,10 @@ def main(argv: list[str] | None = None) -> int:
     _setup_file_log(args.dry_run)
     _install_signal_handlers()
     try:
-        cfg = load_config(args.config)
+        if args.command == "preflight" and not args.config.exists():
+            cfg = None      # a fresh machine: nothing is installed yet, so check the defaults
+        else:
+            cfg = load_config(args.config, secrets=args.command not in READ_ONLY)
         sh = Shell(args.dry_run)
         if args.command == "recover":
             return cmd_recover(cfg, sh, expect=args.expect, original=args.original)

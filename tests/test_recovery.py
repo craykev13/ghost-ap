@@ -28,6 +28,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -1797,6 +1798,270 @@ snapshot_delay = 30
         timer = s.timers["ghostap-snapshot"]
         self.assertEqual(timer["secs"], 30)
         self.assertEqual(timer["argv"][3], "+30s")
+
+
+IW_LIST_ZERO_W = (
+    "Wiphy phy0\n\tmax # scan SSIDs: 10\n\tSupported interface modes:\n\t\t * IBSS\n"
+    "\t\t * managed\n\t\t * AP\n\t\t * P2P-client\n\t\t * P2P-GO\n\t\t * P2P-device\n"
+    "\tBand 1:\n\t\tCapabilities: 0x1062\n")
+IW_LIST_NO_AP = IW_LIST_ZERO_W.replace("\t\t * AP\n", "")
+
+
+class FakeHost(ctl.Shell):
+    """A made-up machine for the preflight to look at: files, commands and installed tools
+    are whatever the test says. Anything not listed behaves like 'not there'."""
+
+    def __init__(self, files=None, cmds=None, tools=()):
+        super().__init__(dry_run=False)
+        self.files, self.cmds, self.tools = files or {}, cmds or {}, set(tools)
+
+    def probe(self, *cmd):
+        return self.cmds.get(cmd, (127, ""))
+
+    def read_text(self, path):
+        return self.files.get(path)
+
+    def which(self, name):
+        return f"/usr/bin/{name}" if name in self.tools else None
+
+
+def pi_host(*, stack="NetworkManager", iw_list=IW_LIST_ZERO_W, country="US",
+            iface="wlan0", systemd=True, tools=None, hostapd=("inactive", "masked"),
+            dnsmasq=("inactive", "disabled"), wifi=("Home",), hotspots=(), model=None,
+            reg_works=True):
+    """A healthy Raspberry Pi Zero W on Bookworm, unless a test breaks something."""
+    c = {}
+    if systemd:
+        c[("test", "-d", "/run/systemd/system")] = (0, "")
+    for svc in ("NetworkManager", "dhcpcd", "systemd-networkd", "wpa_supplicant"):
+        c[("systemctl", "is-active", svc)] = (0 if svc == stack else 3,
+                                              "active" if svc == stack else "inactive")
+    c[("systemctl", "is-active", "wpa_supplicant")] = (0, "active")   # NM runs it too
+    for svc, (act, en) in (("hostapd", hostapd), ("dnsmasq", dnsmasq)):
+        c[("systemctl", "is-active", svc)] = (0 if act == "active" else 3, act)
+        c[("systemctl", "is-enabled", svc)] = (0, en)
+    if iface:
+        c[("ip", "link", "show", "wlan0")] = (0, "")
+    if iw_list is not None:
+        c[("iw", "list")] = (0, iw_list)
+    if reg_works:
+        c[("iw", "reg", "get")] = (0, f"global\ncountry {country}: DFS-FCC\n")
+    lines = [f"{n}:802-11-wireless" for n in (*wifi, *hotspots)] + ["lo:loopback"]
+    c[("nmcli", "-t", "-f", "NAME,TYPE", "connection", "show")] = (0, "\n".join(lines))
+    for n in wifi:
+        c[("nmcli", "-g", "802-11-wireless.mode", "connection", "show", n)] = (0, "infrastructure")
+    for n in hotspots:
+        c[("nmcli", "-g", "802-11-wireless.mode", "connection", "show", n)] = (0, "ap")
+    files = {"/proc/device-tree/model": (model or "Raspberry Pi Zero W Rev 1.1") + "\0",
+             "/etc/os-release": 'PRETTY_NAME="Debian GNU/Linux 12 (bookworm)"\n'}
+    t = tools if tools is not None else ("hostapd", "dnsmasq", "iw", "nmcli", "systemd-run", "ip")
+    return FakeHost(files, c, t)
+
+
+class PreflightTests(unittest.TestCase):
+    def check(self, host):
+        facts = ctl.gather_facts(host)
+        return facts, ctl.judge(facts)
+
+    def titles(self, findings, level=None):
+        return " | ".join(x.title for x in findings if level in (None, x.level))
+
+    # ---- the healthy machine ----------------------------------------------
+    def test_a_healthy_pi_zero_w_passes_with_only_notes(self):
+        facts, found = self.check(pi_host())
+        self.assertEqual(ctl.verdict(found), ctl.OK)
+        self.assertEqual({x.level for x in found}, {ctl.INFO})
+        self.assertIn("Pi Zero", self.titles(found))
+        self.assertEqual((facts.model, facts.os_name),
+                         ("Raspberry Pi Zero W Rev 1.1", "Debian GNU/Linux 12 (bookworm)"))
+        self.assertTrue(facts.ap_mode)
+        self.assertEqual((facts.wifi_profiles, facts.ap_profiles, facts.reg_country),
+                         (1, (), "US"))
+
+    # ---- things that stop it ------------------------------------------------
+    def test_dhcpcd_machine_is_blocked_and_says_why(self):
+        _, found = self.check(pi_host(stack="dhcpcd"))
+        self.assertEqual(ctl.verdict(found), ctl.BLOCK)
+        self.assertIn("dhcpcd", self.titles(found, ctl.BLOCK))
+
+    def test_systemd_networkd_machine_is_blocked(self):
+        _, found = self.check(pi_host(stack="systemd-networkd"))
+        self.assertEqual(ctl.verdict(found), ctl.BLOCK)
+        self.assertIn("systemd-networkd", self.titles(found, ctl.BLOCK))
+
+    def test_no_network_manager_at_all_is_blocked(self):
+        _, found = self.check(pi_host(stack="none"))
+        self.assertEqual(ctl.verdict(found), ctl.BLOCK)
+        self.assertIn("NetworkManager isn't running", self.titles(found, ctl.BLOCK))
+
+    def test_wpa_supplicant_alone_is_not_mistaken_for_another_stack(self):
+        # NetworkManager runs wpa_supplicant itself, so seeing it is normal
+        _, found = self.check(pi_host())
+        self.assertNotIn("dhcpcd", self.titles(found))
+
+    def test_no_systemd_is_blocked(self):
+        _, found = self.check(pi_host(systemd=False))
+        self.assertIn("systemd", self.titles(found, ctl.BLOCK))
+
+    def test_missing_tools_are_blocked_with_the_install_command(self):
+        _, found = self.check(pi_host(tools=("iw", "nmcli", "systemd-run", "ip")))
+        titles = self.titles(found, ctl.BLOCK)
+        self.assertIn("hostapd isn't installed", titles)
+        self.assertIn("dnsmasq isn't installed", titles)
+        fixes = " ".join(x.fix for x in found)
+        self.assertIn("apt install hostapd", fixes)
+        self.assertIn("apt install dnsmasq-base", fixes)
+
+    def test_wifi_chip_without_ap_mode_is_blocked(self):
+        _, found = self.check(pi_host(iw_list=IW_LIST_NO_AP))
+        self.assertIn("can't run as an access point", self.titles(found, ctl.BLOCK))
+
+    def test_missing_wifi_interface_is_blocked(self):
+        _, found = self.check(pi_host(iface=None))
+        self.assertIn("No WiFi interface named wlan0", self.titles(found, ctl.BLOCK))
+
+    # ---- things worth a warning ------------------------------------------
+    def test_unanswered_ap_question_is_a_warning_not_a_block(self):
+        facts, found = self.check(pi_host(iw_list=None))
+        self.assertIsNone(facts.ap_mode)
+        self.assertEqual(ctl.verdict(found), ctl.WARN)
+        self.assertIn("Couldn't confirm", self.titles(found, ctl.WARN))
+
+    def test_unset_country_warns_and_names_the_fix(self):
+        for country in ("00", None):
+            host = pi_host(country=country or "US", reg_works=country is not None)
+            _, found = self.check(host)
+            self.assertEqual(ctl.verdict(found), ctl.WARN, country)
+            self.assertIn("country", self.titles(found, ctl.WARN))
+        self.assertIn("raspi-config", " ".join(x.fix for x in found))
+
+    def test_system_hostapd_or_dnsmasq_service_warns(self):
+        for kw in ({"hostapd": ("active", "enabled")}, {"hostapd": ("inactive", "enabled")},
+                   {"dnsmasq": ("active", "enabled")}, {"dnsmasq": ("inactive", "enabled")}):
+            _, found = self.check(pi_host(**kw))
+            self.assertEqual(ctl.verdict(found), ctl.WARN, kw)
+            self.assertIn(list(kw)[0], self.titles(found, ctl.WARN))
+
+    def test_masked_or_disabled_services_are_fine(self):
+        _, found = self.check(pi_host(hostapd=("inactive", "masked"),
+                                      dnsmasq=("inactive", "disabled")))
+        self.assertEqual(ctl.verdict(found), ctl.OK)
+
+    def test_leftover_hotspot_profile_warns_and_is_named(self):
+        facts, found = self.check(pi_host(hotspots=("ZeroFi-Hotspot",)))
+        self.assertEqual(facts.ap_profiles, ("ZeroFi-Hotspot",))
+        self.assertEqual(facts.wifi_profiles, 1)         # the hotspot isn't a client network
+        self.assertEqual(ctl.verdict(found), ctl.WARN)
+        self.assertIn("ZeroFi-Hotspot", self.titles(found, ctl.WARN))
+
+    def test_no_saved_wifi_is_just_a_note(self):
+        _, found = self.check(pi_host(wifi=()))
+        self.assertEqual(ctl.verdict(found), ctl.OK)
+        self.assertIn("No saved WiFi", self.titles(found, ctl.INFO))
+
+    def test_profile_names_with_colons_are_read_correctly(self):
+        host = pi_host(wifi=(), hotspots=())
+        host.cmds[("nmcli", "-t", "-f", "NAME,TYPE", "connection", "show")] = (
+            0, "Cafe\\: Guest:802-11-wireless")
+        host.cmds[("nmcli", "-g", "802-11-wireless.mode", "connection", "show",
+                   "Cafe: Guest")] = (0, "ap")
+        facts, _ = self.check(host)
+        self.assertEqual(facts.ap_profiles, ("Cafe: Guest",))
+
+    def test_other_boards_get_a_note_not_a_block(self):
+        _, found = self.check(pi_host(model="Orange Pi 5"))
+        self.assertEqual(ctl.verdict(found), ctl.OK)
+        self.assertIn("doesn't look like a Raspberry Pi", self.titles(found, ctl.INFO))
+
+    def test_a_pi_4_gets_no_zero_note(self):
+        _, found = self.check(pi_host(model="Raspberry Pi 4 Model B Rev 1.5"))
+        self.assertNotIn("Zero", self.titles(found))
+
+    # ---- parsing and output --------------------------------------------------
+    def test_ap_mode_parser(self):
+        self.assertIs(ctl._ap_supported(IW_LIST_ZERO_W), True)
+        self.assertIs(ctl._ap_supported(IW_LIST_NO_AP), False)
+        self.assertIsNone(ctl._ap_supported("nothing useful"))
+        # 'AP/VLAN' and 'P2P-GO' are other modes, not plain AP
+        self.assertIs(ctl._ap_supported(
+            "\tSupported interface modes:\n\t\t * AP/VLAN\n\t\t * P2P-GO\n"), False)
+
+    def test_verdict_is_the_worst_finding(self):
+        F = ctl.Finding
+        self.assertEqual(ctl.verdict([]), ctl.OK)
+        self.assertEqual(ctl.verdict([F(ctl.INFO, "a")]), ctl.OK)
+        self.assertEqual(ctl.verdict([F(ctl.INFO, "a"), F(ctl.WARN, "b")]), ctl.WARN)
+        self.assertEqual(ctl.verdict([F(ctl.WARN, "b"), F(ctl.BLOCK, "c")]), ctl.BLOCK)
+
+    def test_report_puts_blockers_first_and_includes_fixes_and_the_caveat(self):
+        host = pi_host(iw_list=IW_LIST_NO_AP, hotspots=("ZeroFi-Hotspot",))
+        facts, found = self.check(host)
+        text = ctl.render_preflight(facts, found)
+        self.assertLess(text.index("[X]"), text.index("[!]"))
+        self.assertLess(text.index("[!]"), text.index("[i]"))
+        self.assertIn("Fix:", text)
+        self.assertIn("Not supported on this machine", text)
+        self.assertIn("not a guarantee", text)
+
+    def test_exit_code_is_nonzero_only_for_blockers(self):
+        cfg = types.SimpleNamespace(interface="wlan0")
+        for host, code in ((pi_host(), 0), (pi_host(country="00"), 0),
+                           (pi_host(stack="dhcpcd"), 1)):
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(ctl.cmd_preflight(cfg, host), code)
+
+    def test_preflight_runs_on_a_fresh_machine_with_no_config_and_no_root(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = ctl.main(["preflight", "-c", "/nonexistent/ghostap.toml"])
+        self.assertIn(rc, (0, 1))
+        self.assertIn("Checked:", out.getvalue())
+
+
+class ReadOnlyCommandTests(unittest.TestCase):
+    """`status` only looks, so it must not need the password file (or root to read it)."""
+
+    def conf(self, pw_exists=True):
+        d = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        if pw_exists:
+            (d / "pw").write_text("testpass123\n")
+            os.chmod(d / "pw", 0o000)          # like root-only: this user can't read it
+        (d / "c.toml").write_text(
+            f'[access_point]\nssid = "ZeroFi"\npassphrase_file = "{d / "pw"}"\n'
+            '[dhcp]\nstart = "192.168.4.10"\nend = "192.168.4.50"\n')
+        return d / "c.toml"
+
+    def test_loading_without_secrets_skips_the_password_file(self):
+        for exists in (True, False):
+            cfg = ctl.load_config(self.conf(exists), secrets=False)
+            self.assertEqual(cfg.ssid, "ZeroFi")
+            self.assertEqual(cfg.passphrase, ctl._UNREAD_SECRET)
+
+    def test_commands_that_build_the_ap_still_need_the_password(self):
+        with self.assertRaises(ctl.GhostAPError) as cm:
+            ctl.load_config(self.conf(pw_exists=False))
+        self.assertIn("passphrase", str(cm.exception))
+
+    def test_a_config_loaded_without_its_password_can_never_make_an_ap(self):
+        cfg = ctl.load_config(self.conf(), secrets=False)
+        with self.assertRaises(ctl.GhostAPError):
+            ctl.render_hostapd(cfg)
+
+    def test_only_looking_commands_are_read_only(self):
+        self.assertEqual(set(ctl.READ_ONLY), {"status", "preflight"})
+        for cmd in ("start", "stop", "recover", "test", "failover", "event"):
+            self.assertNotIn(cmd, ctl.READ_ONLY)
+
+    def test_status_works_end_to_end_without_the_password(self):
+        path = self.conf()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), \
+                mock.patch.dict(ctl.COMMANDS, {"status": mock.Mock(return_value=0)}):
+            m = ctl.COMMANDS["status"]
+            rc = ctl.main(["status", "-c", str(path)])
+        self.assertEqual(rc, 0)
+        self.assertEqual(m.call_args.args[0].passphrase, ctl._UNREAD_SECRET)
 
 
 if __name__ == "__main__":

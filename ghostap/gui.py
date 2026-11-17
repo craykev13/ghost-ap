@@ -27,6 +27,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs
 
 log = logging.getLogger("ghostap.gui")
 
@@ -183,7 +184,8 @@ class Cached:
 
 class App:
     def __init__(self, provider, password_hash: str, clock=time.monotonic, settings=None,
-                 applier=None):
+                 applier=None, logs=None):
+        self.logs = logs                # something with read(source, lines) and sources()
         self.settings = settings        # something with get() and save(changes, version)
         self.applier = applier          # something with request(action)
         self.auth = Auth(password_hash, clock)
@@ -289,6 +291,23 @@ def make_handler(app: App):
                 except Exception:           # never show the person a traceback
                     log.exception("status failed")
                     return self._error(500, "couldn't read the status")
+            if path == "/api/logs" and app.logs is not None:
+                if not self._authed():
+                    return self._error(401, "sign in first")
+                query = parse_qs(self.path.partition("?")[2])
+                source = (query.get("source") or ["activity"])[0]
+                try:
+                    lines = int((query.get("lines") or [200])[0])
+                except ValueError:
+                    return self._error(400, "lines must be a number")
+                try:
+                    body = app.logs.read(source, lines)
+                except ValueError as e:
+                    return self._error(400, str(e))
+                except Exception:
+                    log.exception("reading logs failed")
+                    return self._error(500, "couldn't read the logs")
+                return self._json(200, {**body, "sources": app.logs.sources()})
             if path == "/api/settings" and app.settings is not None:
                 if not self._authed():
                     return self._error(401, "sign in first")
@@ -367,10 +386,11 @@ def make_handler(app: App):
 
 
 def make_server(provider, password_hash: str, host: str, port: int,
-                clock=time.monotonic, settings=None, applier=None) -> ThreadingHTTPServer:
+                clock=time.monotonic, settings=None, applier=None,
+                logs=None) -> ThreadingHTTPServer:
     if not password_hash:
         raise ValueError("no admin password is set")
-    app = App(provider, password_hash, clock, settings, applier)
+    app = App(provider, password_hash, clock, settings, applier, logs)
     server = ThreadingHTTPServer((host, port), make_handler(app))
     server.daemon_threads = True
     server.app = app

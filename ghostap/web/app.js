@@ -474,26 +474,91 @@ $("settings-view").addEventListener("submit", async (ev) => {
   }
 });
 
+// ---- logs ----
+let logTimer = null;
+let logLines = [];
+
+function levelOf(line) {
+  if (/\b(ERROR|CRIT|FATAL|FAIL(ED)?)\b/i.test(line)) return "bad-text";
+  if (/\bWARN(ING)?\b/i.test(line)) return "warn-text";
+  return "";
+}
+
+async function loadLogs() {
+  const sel = $("log-source");
+  const source = sel.value || "activity";
+  try {
+    const r = await api("/api/logs?source=" + encodeURIComponent(source) + "&lines=500");
+    if (r.status === 401) { show("login"); return; }
+    if (!r.ok) { $("log-note").textContent = (r.data && r.data.error) || "Couldn't load the log."; return; }
+    if (!sel.options.length) {
+      r.data.sources.forEach((s) => { const o = el("option", null, s.title); o.value = s.id; sel.appendChild(o); });
+    }
+    sel.value = r.data.source;
+    $("log-note").textContent = r.data.note || "";
+    logLines = r.data.lines;
+    const box = $("log-box");
+    const atEnd = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+    // shorter timestamps on screen (the full lines are what Copy gives you)
+    const short = (l) => l.replace(/^\d{4}-(\d\d-\d\d)T(\d\d:\d\d:\d\d)[+-]\d{4} \S+ /, "$1 $2 ");
+    box.replaceChildren(...logLines.map((l) => el("div", "logline " + levelOf(l), short(l))));
+    if (atEnd || !box.dataset.shown) { box.scrollTop = box.scrollHeight; box.dataset.shown = "1"; }
+  } catch (e) {
+    $("log-note").textContent = "Can't reach the Pi.";
+  }
+}
+
+function copyLogs() {
+  // the clipboard API needs https; this page is plain http, so use the old way
+  const ta = el("textarea");
+  ta.value = logLines.join("\n");
+  ta.className = "sr-only";
+  document.body.appendChild(ta);
+  ta.select();
+  let ok = false;
+  try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+  ta.remove();
+  $("log-note").textContent = ok ? "Copied " + logLines.length + " lines." : "Couldn't copy. Select the text instead.";
+}
+
+function setLogAuto() {
+  if (logTimer) { clearInterval(logTimer); logTimer = null; }
+  if ($("log-auto").checked && view === "logs") {
+    logTimer = setInterval(() => { if (!document.hidden) loadLogs(); }, 5000);
+  }
+}
+
+$("log-source").addEventListener("change", () => { $("log-box").dataset.shown = ""; loadLogs(); });
+$("log-refresh").addEventListener("click", loadLogs);
+$("log-copy").addEventListener("click", copyLogs);
+$("log-auto").addEventListener("change", setLogAuto);
+
 // ---- which page ----
+const TITLES = { status: "Status", settings: "Settings", logs: "Logs" };
+
 function route() {
-  view = location.hash === "#settings" ? "settings" : "status";
+  const name = location.hash.slice(1);
+  view = TITLES[name] ? name : "status";
   $("status-view").hidden = view !== "status";
   $("settings-view").hidden = view !== "settings";
+  $("logs-view").hidden = view !== "logs";
   $("pill").hidden = view !== "status";
   $("banner").hidden = view !== "status" || failures < 2;
-  $("title").textContent = view === "settings" ? "Settings" : "Status";
-  $("nav-status").className = "nav-item" + (view === "status" ? " active" : "");
-  $("nav-settings").className = "nav-item" + (view === "settings" ? " active" : "");
-  if (view === "status") $("nav-status").setAttribute("aria-current", "page");
-  else $("nav-status").removeAttribute("aria-current");
+  $("title").textContent = TITLES[view];
+  Object.keys(TITLES).forEach((n) => {
+    const link = $("nav-" + n);
+    link.className = "nav-item" + (view === n ? " active" : "");
+    if (view === n) link.setAttribute("aria-current", "page");
+    else link.removeAttribute("aria-current");
+  });
   if (view === "settings") {
-    $("nav-settings").setAttribute("aria-current", "page");
     if (!form) loadSettings();
     refresh();
-  } else {
-    $("nav-settings").removeAttribute("aria-current");
-    if (lastStatus) refresh();
+  } else if (lastStatus && view === "status") {
+    refresh();
   }
+  if (view === "logs") loadLogs();
+  setLogAuto();
 }
 window.addEventListener("hashchange", route);
 

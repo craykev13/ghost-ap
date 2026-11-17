@@ -123,6 +123,15 @@ button.secondary:disabled { opacity: .5; cursor: default; }
 .steps { margin: 0; padding-left: 20px; display: grid; gap: 6px; font-size: 14px; }
 .card .actions { position: static; border: 0; padding: 0; background: none; }
 
+.warn-text { color: var(--warn); }
+.logs-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; }
+.logs-bar select { width: auto; flex: 1 1 160px; }
+.logs-bar button.secondary { padding: 9px 14px; }
+.logbox { background: var(--card); border-radius: var(--radius); box-shadow: var(--shadow);
+  padding: 12px 14px; height: 62vh; overflow: auto; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.logline { white-space: pre-wrap; overflow-wrap: anywhere; border-top: 1px solid var(--line); padding: 2px 0; }
+.logline:first-child { border-top: 0; }
+
 /* folding sections and the save bar */
 details.fold { padding: 0; gap: 0; }
 details.fold > summary { cursor: pointer; padding: 16px 20px; list-style: none; font-size: 13px;

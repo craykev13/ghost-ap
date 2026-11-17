@@ -8,6 +8,7 @@ let timer = null;
 let failures = 0;
 let view = "status";
 let form = null;        // the loaded settings form: { version, controls: [...] }
+let lastStatus = null;  // the newest /api/status, for the pages that need to know the mode
 
 function el(tag, cls, text) {
   const node = document.createElement(tag);
@@ -101,7 +102,8 @@ function render(s) {
     const left = s.live_test.seconds_left;
     const a = card("Test running",
       el("p", "big", left === null ? "Reverts on its own soon" : "Reverts in about " + left + " s"),
-      el("p", "muted", "A test of the fallback network is in progress. It undoes itself unless you keep it with: sudo ghostap test --commit"));
+      el("p", "muted", "A test of the fallback network is in progress. It undoes itself unless you keep it."),
+      actionButtons([["Keep this", "commit", "primary"], ["Revert now", "abort", "secondary"]]));
     a.className = "card wide alert";
     cards.appendChild(a);
   }
@@ -141,6 +143,15 @@ function render(s) {
   cards.appendChild(card("This device",
     rows([["Name", s.hostname], ["WiFi interface", s.interface]])));
 
+  const last = s.apply && s.apply.last;
+  if (last) {
+    const when = last.at ? " (" + new Date(last.at * 1000).toLocaleString() + ")" : "";
+    const lc = card("Last request from this page",
+      el("p", last.ok ? "ok-text" : "bad-text", last.message), el("p", "muted small", when.trim()));
+    lc.className = "card wide";
+    cards.appendChild(lc);
+  }
+
   $("updated").textContent = "Updated " + new Date().toLocaleTimeString();
 }
 
@@ -151,7 +162,9 @@ async function refresh() {
     if (!r.ok) throw new Error("status " + r.status);
     failures = 0;
     $("banner").hidden = true;
+    lastStatus = r.data;
     render(r.data);
+    renderApply();
   } catch (e) {
     failures += 1;
     if (failures >= 2) {
@@ -171,6 +184,95 @@ function stopPolling() { if (timer) { clearInterval(timer); timer = null; } }
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden && !$("app").hidden && view === "status") refresh();
 });
+
+// ---- trying settings / keeping or reverting a test ----
+let applyMsg = null;        // { text, cls } shown under the buttons
+let confirming = false;
+
+async function sendApply(action) {
+  applyMsg = { text: "Sending...", cls: "" };
+  renderApply();
+  try {
+    const r = await api("/api/apply", { action });
+    if (r.status === 401) { show("login"); return; }
+    if (!r.ok) {
+      applyMsg = { text: (r.data && r.data.error) || "Couldn't send that.", cls: "bad" };
+    } else if (action === "test") {
+      applyMsg = { text: "Sent. The Pi is switching networks now, so this page will lose contact. "
+        + "Join the Pi's network and open it there (steps above).", cls: "ok" };
+    } else {
+      applyMsg = { text: action === "commit" ? "Keeping it..." : "Reverting...", cls: "ok" };
+      setTimeout(refresh, 2500);
+    }
+  } catch (e) {
+    applyMsg = { text: "Can't reach the Pi. If it switched networks, follow the steps above.", cls: "bad" };
+  }
+  confirming = false;
+  renderApply();
+}
+
+function actionButtons(list) {
+  const box = el("div", "actions");
+  list.forEach(([label, action, cls]) => {
+    const b = el("button", cls, label);
+    b.type = "button";
+    b.addEventListener("click", () => sendApply(action));
+    box.appendChild(b);
+  });
+  return box;
+}
+
+function renderApply() {
+  const box = $("apply-card");
+  box.replaceChildren();
+  box.appendChild(el("h3", null, "Try the saved settings"));
+  const s = lastStatus;
+  const say = (text) => box.appendChild(el("p", "muted", text));
+  if (!s || !s.apply) { say("Loading..."); return; }
+  if (!s.apply.available) {
+    say("Trying settings from this page needs a small helper that isn't installed yet. "
+      + "Run sudo python3 install.py again in the ghost-ap folder.");
+    return;
+  }
+  if (s.live_test) {
+    say("A test is already running. Keep it or revert it from the Status page.");
+    box.appendChild(actionButtons([["Keep this", "commit", "primary"], ["Revert now", "abort", "secondary"]]));
+    return;
+  }
+  if (s.mode === "ap") {
+    say("The Pi is already running its own network. Saved settings are used the next time it "
+      + "starts that network (for example after a reboot).");
+    return;
+  }
+  say("Saving only changes the file. To see it work, the Pi can raise its own network with these "
+    + "settings. It undoes itself after about " + s.live_timeout + " seconds unless you tap Keep.");
+  if (s.apply.pending) { say("A request is already being carried out..."); return; }
+  const dirty = form && form.controls.some((c) => c.dirty());
+  if (!confirming) {
+    const b = el("button", "secondary", "Try the saved settings...");
+    b.type = "button"; b.disabled = !!dirty;
+    b.addEventListener("click", () => { confirming = true; renderApply(); });
+    box.appendChild(b);
+    if (dirty) say("Save your changes first.");
+  } else {
+    const steps = el("ol", "steps");
+    [s.mode === "client" ? "The Pi leaves its WiFi, so this page will stop responding. That's expected."
+                         : "The Pi raises its own network.",
+     "On your phone, join the WiFi network \"" + s.ssid + "\".",
+     "Open http://" + s.gateway + ":" + s.gui_port + " and sign in again.",
+     "Tap Keep. If you do nothing, it reverts by itself and the Pi rejoins its WiFi."
+    ].forEach((t) => steps.appendChild(el("li", null, t)));
+    box.appendChild(steps);
+    const row = el("div", "actions");
+    const go = el("button", "primary", "Yes, try it now"); go.type = "button";
+    go.addEventListener("click", () => sendApply("test"));
+    const no = el("button", "secondary", "Cancel"); no.type = "button";
+    no.addEventListener("click", () => { confirming = false; renderApply(); });
+    row.appendChild(go); row.appendChild(no);
+    box.appendChild(row);
+  }
+  if (applyMsg) box.appendChild(el("p", "form-msg " + applyMsg.cls, applyMsg.text));
+}
 
 // ---- settings ----
 const SECTIONS = {
@@ -278,6 +380,7 @@ function updateButtons() {
   const n = form.controls.filter((c) => c.dirty()).length;
   $("settings-save").disabled = n === 0 || form.saving;
   $("settings-undo").disabled = n === 0 || form.saving;
+  if (typeof renderApply === "function") renderApply();
   $("settings-save").textContent = n ? "Save " + n + " change" + (n === 1 ? "" : "s") : "Save changes";
   applyAdvanced();
 }
@@ -379,6 +482,7 @@ function route() {
   if (view === "settings") {
     $("nav-settings").setAttribute("aria-current", "page");
     if (!form) loadSettings();
+    refresh();
   } else $("nav-settings").removeAttribute("aria-current");
 }
 window.addEventListener("hashchange", route);

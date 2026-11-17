@@ -1,0 +1,10 @@
+[Unit]
+Description=GhostAP: watch for a request from the admin page
+
+[Path]
+# The admin page leaves a small request file here. Nothing else triggers this.
+PathExists=/run/ghostap-gui/request
+Unit=ghostap-apply.service
+
+[Install]
+WantedBy=multi-user.target

@@ -61,6 +61,9 @@ DISPATCHER = "/etc/NetworkManager/dispatcher.d/90-ghostap"
 GUI_PASSWORD = f"{CONF_DIR}/gui-password"
 GUI_SERVICE = "/etc/systemd/system/ghostap-gui.service"
 GUI_UNIT = "ghostap-gui.service"
+APPLY_SERVICE = "/etc/systemd/system/ghostap-apply.service"
+APPLY_PATH = "/etc/systemd/system/ghostap-apply.path"
+APPLY_PATH_UNIT = "ghostap-apply.path"
 DEFAULT_GUI_PORT = 8480
 JOURNAL = "/etc/systemd/journald.conf.d/99-persistent.conf"
 STATE_DIR = "/var/lib/ghostap"
@@ -434,6 +437,15 @@ def _plan_admin_unit(host: Host, c: Choices, plan: Plan, repo: Path) -> bool:
         "file", GUI_SERVICE, f"Install the admin page service {GUI_SERVICE}", data=unit,
         mode=0o644, status="same" if unit_same
         else "replace" if host.exists(GUI_SERVICE) else "new"))
+    # the small root helper that lets the page try settings without having network powers
+    for target, name, what in ((APPLY_SERVICE, "ghostap-apply.service", "the helper"),
+                               (APPLY_PATH, "ghostap-apply.path", "the helper's trigger")):
+        data = (repo / "systemd" / name).read_bytes()
+        same = _same_file(host, target, data, 0o644)
+        unit_same = unit_same and same
+        plan.steps.append(Step(
+            "file", target, f"Install {what} {target}", data=data, mode=0o644,
+            status="same" if same else "replace" if host.exists(target) else "new"))
     exists = host.exists(GUI_PASSWORD)
     if c.admin_password is not None:
         err = check_admin_password(c.admin_password)
@@ -472,6 +484,16 @@ def _plan_admin_enable(host: Host, c: Choices, plan: Plan) -> None:
     if changed:
         plan.steps.append(Step("cmd", GUI_UNIT, "(Re)start the admin page so it picks this up",
                                cmd=("systemctl", "restart", GUI_UNIT), check=False))
+    # the helper's trigger only watches for a file; it never touches the network by itself
+    watcher = host.run(("systemctl", "is-enabled", APPLY_PATH_UNIT), check=False)[1]
+    plan.steps.append(Step(
+        "cmd", APPLY_PATH_UNIT, "Enable the helper that lets the admin page try settings",
+        cmd=("systemctl", "enable", "--now", APPLY_PATH_UNIT),
+        undo=("systemctl", "disable", "--now", APPLY_PATH_UNIT),
+        status="same" if watcher.startswith("enabled") else "new"))
+    if any(s.status != "same" for s in plan.steps if s.target in (APPLY_SERVICE, APPLY_PATH)):
+        plan.steps.append(Step("cmd", APPLY_PATH_UNIT, "(Re)start the helper's trigger",
+                               cmd=("systemctl", "restart", APPLY_PATH_UNIT), check=False))
 
 
 def check_admin_password(p: str) -> str | None:

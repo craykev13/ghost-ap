@@ -181,8 +181,10 @@ class Cached:
 # ---- the web server ---------------------------------------------------------------------
 
 class App:
-    def __init__(self, provider, password_hash: str, clock=time.monotonic, settings=None):
+    def __init__(self, provider, password_hash: str, clock=time.monotonic, settings=None,
+                 applier=None):
         self.settings = settings        # something with get() and save(changes, version)
+        self.applier = applier          # something with request(action)
         self.auth = Auth(password_hash, clock)
         self.status = Cached(provider, clock=clock)
 
@@ -316,6 +318,21 @@ def make_handler(app: App):
                     return self._error(401, "sign in first")
                 data = self._same_origin_json_post()
                 return None if data is None else self._save_settings(data)
+            if path == "/api/apply" and app.applier is not None:
+                if not self._authed():
+                    return self._error(401, "sign in first")
+                data = self._same_origin_json_post()
+                if data is None:
+                    return None
+                try:
+                    app.applier.request(data.get("action"))
+                except app.applier.Rejected as e:
+                    return self._error(400, str(e))
+                except Exception:
+                    log.exception("apply request failed")
+                    return self._error(500, "couldn't send the request")
+                log.info("admin page asked to %s", data.get("action"))
+                return self._json(200, {"ok": True})
             if path not in ("/api/login", "/api/logout"):
                 return self._error(404, "not found")
             data = self._same_origin_json_post()
@@ -349,10 +366,10 @@ def make_handler(app: App):
 
 
 def make_server(provider, password_hash: str, host: str, port: int,
-                clock=time.monotonic, settings=None) -> ThreadingHTTPServer:
+                clock=time.monotonic, settings=None, applier=None) -> ThreadingHTTPServer:
     if not password_hash:
         raise ValueError("no admin password is set")
-    app = App(provider, password_hash, clock, settings)
+    app = App(provider, password_hash, clock, settings, applier)
     server = ThreadingHTTPServer((host, port), make_handler(app))
     server.daemon_threads = True
     server.app = app

@@ -1,0 +1,10 @@
+[Unit]
+Description=GhostAP: carry out a request from the admin page
+
+[Service]
+Type=oneshot
+# Same reasoning as ghostap.service: if this process ends, leave hostapd/dnsmasq
+# running. A test AP must not die just because the thing that started it exited.
+KillMode=process
+TimeoutStartSec=300
+ExecStart=/usr/bin/python3 /usr/local/bin/ghostap apply-request

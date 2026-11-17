@@ -686,7 +686,8 @@ class AdminPageInstallTests(Rig):
         return ctl._gui_module()
 
     def enable_everything(self):
-        self.runner.enabled.update({"ghostap.service": "enabled", inst.GUI_UNIT: "enabled"})
+        self.runner.enabled.update({"ghostap.service": "enabled", inst.GUI_UNIT: "enabled",
+                                    inst.APPLY_PATH_UNIT: "enabled"})
 
     def test_the_page_is_off_unless_asked_for(self):
         plan, _ = self.plan(inst.Choices(passphrase="correct horse"))
@@ -733,7 +734,8 @@ class AdminPageInstallTests(Rig):
     def test_the_page_is_only_started_by_a_restart_and_only_when_something_changed(self):
         self.install()
         for c in self.runner.calls:
-            if "--now" in c:
+            # the helper's trigger only watches for a file, so it may be switched on now
+            if "--now" in c and inst.APPLY_PATH_UNIT not in c:
                 self.fail(f"started something at install time: {c}")
         self.enable_everything()
         self.runner.calls.clear()
@@ -798,6 +800,8 @@ class AdminPageInstallTests(Rig):
         self.host.write(inst.GUI_PASSWORD,
                         (self.gui().hash_password("x" * 10, iterations=1000) + "\n").encode(), 0o600)
         self.host.write(inst.GUI_SERVICE, (ROOT / "systemd/ghostap-gui.service").read_bytes(), 0o644)
+        self.host.write(inst.APPLY_SERVICE, (ROOT / "systemd/ghostap-apply.service").read_bytes(), 0o644)
+        self.host.write(inst.APPLY_PATH, (ROOT / "systemd/ghostap-apply.path").read_bytes(), 0o644)
         self.host.write(inst.SERVICE, (ROOT / "systemd/ghostap.service").read_bytes(), 0o644)
         self.host.write(inst.DISPATCHER, (ROOT / "nm-dispatcher/90-ghostap").read_bytes(), 0o755)
         self.host.symlink(inst.LINK, str(ROOT / "ghostap" / "controller.py"))
@@ -805,6 +809,51 @@ class AdminPageInstallTests(Rig):
         plan, _ = self.plan(inst.Choices(keep_config=True, admin_page=True))
         self.assertEqual(plan.changes(), [])
         self.assertEqual(plan.notes and [n for n in plan.notes if "admin page is off" in n], [])
+
+    def test_a_pi_with_the_page_but_not_the_helper_gets_exactly_the_helper(self):
+        """The ZeroFi as it was before 'try these settings' existed."""
+        self.install()
+        self.enable_everything()
+        del self.runner.enabled[inst.APPLY_PATH_UNIT]
+        self.host.remove(inst.APPLY_SERVICE)
+        self.host.remove(inst.APPLY_PATH)
+        plan, _ = self.plan()
+        self.assertEqual({s.target for s in plan.changes()},
+                         {inst.APPLY_SERVICE, inst.APPLY_PATH, "systemd", inst.APPLY_PATH_UNIT})
+        self.assertTrue(any(s.cmd == ("systemctl", "daemon-reload") for s in plan.steps))
+
+    def test_the_helper_is_installed_enabled_and_watches_for_the_pages_request(self):
+        self.install()
+        self.assertEqual(self.host.read(inst.APPLY_SERVICE),
+                         (ROOT / "systemd/ghostap-apply.service").read_bytes())
+        self.assertEqual(self.host.read(inst.APPLY_PATH),
+                         (ROOT / "systemd/ghostap-apply.path").read_bytes())
+        self.assertTrue(self.runner.ran("systemctl", "enable", "--now", inst.APPLY_PATH_UNIT))
+        self.assertFalse(self.runner.ran("systemctl", "enable", "ghostap-apply.service"))
+
+    def test_the_helper_is_not_installed_without_the_page(self):
+        plan, _ = self.plan(inst.Choices(passphrase="correct horse"))
+        self.assertFalse({inst.APPLY_SERVICE, inst.APPLY_PATH, inst.APPLY_PATH_UNIT}
+                         & {s.target for s in plan.steps})
+
+    def test_a_changed_helper_unit_reloads_systemd_and_restarts_its_trigger(self):
+        self.install()
+        self.enable_everything()
+        self.path(inst.APPLY_SERVICE).write_text("# edited\n")
+        self.runner.calls.clear()
+        plan, c = self.plan()
+        self.assertEqual([s.status for s in plan.steps if s.target == inst.APPLY_SERVICE],
+                         ["replace"])
+        inst.apply_plan(self.host, plan, c)
+        self.assertTrue(self.runner.ran("systemctl", "daemon-reload"))
+        self.assertTrue(self.runner.ran("systemctl", "restart", inst.APPLY_PATH_UNIT))
+
+    def test_uninstall_takes_the_helper_away_too(self):
+        self.install()
+        inst.uninstall(self.host, say=lambda m: None)
+        self.assertFalse(self.host.exists(inst.APPLY_SERVICE))
+        self.assertFalse(self.host.exists(inst.APPLY_PATH))
+        self.assertTrue(self.runner.ran("systemctl", "disable", "--now", inst.APPLY_PATH_UNIT))
 
     def test_a_kept_config_without_the_page_switch_gets_a_note_not_an_edit(self):
         self.host.write(inst.CONF, b"# mine\n", 0o644)

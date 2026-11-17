@@ -1775,6 +1775,20 @@ snapshot_delay = 30
                 ctl.load_config(d / "c.toml")
             self.assertIn(word, str(cm.exception))
 
+    def test_country_must_be_a_two_character_code(self):
+        def load(country):
+            path = self.write_config()
+            path.write_text(path.read_text().replace(
+                'ssid = "ZeroFi"', f'ssid = "ZeroFi"\ncountry = "{country}"'))
+            return ctl.load_config(path)
+
+        for good in ("US", "gb", "00"):
+            self.assertEqual(load(good).country, good)
+        for bad in ("USA", "U", "", "U S", "\u00dcS"):
+            with self.assertRaises(ctl.GhostAPError, msg=repr(bad)) as cm:
+                load(bad)
+            self.assertIn("country", str(cm.exception))
+
     def test_weak_security_is_allowed_but_flagged(self):
         cfg_path = self.write_config('')
         cfg = ctl.load_config(cfg_path)

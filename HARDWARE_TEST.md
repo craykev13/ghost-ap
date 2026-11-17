@@ -54,6 +54,8 @@ check as in B.6. `cat /run/ghostap/ghostap.log` shows the last thing the control
 `systemctl list-timers --all | grep ghostap`, `nmcli device status`, `pgrep -a 'hostapd|dnsmasq'`
 
 ## E. Boot fallback and failover (verified on ZeroFi)
+The installer (`sudo python3 install.py`) does all of the following for you. By hand, it is:
+
 Install the boot service and the NetworkManager hook, and turn failover on:
 ```
 sudo ln -sf ~/ghost-ap/ghostap/controller.py /usr/local/bin/ghostap
@@ -89,4 +91,4 @@ sudo journalctl -b -1 --no-pager | grep -iE 'ghostap|hostapd|dnsmasq|Killing pro
 (`-b -1` is the previous boot, so it needs the persistent journal.)
 
 ## Not covered yet
-The installer, a web GUI, and a link-health check after the AP-to-client switch.
+The web GUI, and a link-health check after the AP-to-client switch.

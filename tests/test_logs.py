@@ -38,11 +38,14 @@ class Rig(unittest.TestCase):
         self.test_log = self.dir / "ghostap.log"
         self.snap = self.dir / "snap.log"
         self.calls = []
-        self.answer = (0, "")
+        self.answer = (0, "")            # what every command says, unless `answers` is set
+        self.answers = None              # or one answer per command, in order
         self.reader = ctl.LogReader(self.runner, self.test_log, self.snap)
 
     def runner(self, argv):
         self.calls.append(argv)
+        if self.answers is not None:
+            return self.answers[len(self.calls) - 1]
         return self.answer
 
 
@@ -60,51 +63,94 @@ class RedactTests(unittest.TestCase):
             self.assertEqual(ctl.redact(line), line)
 
 
+def _flags(argv, flag):
+    return [argv[i + 1] for i, a in enumerate(argv) if a == flag]
+
+
 class JournalTests(Rig):
-    def test_it_asks_for_our_units_and_the_daemons_we_start_and_nothing_else(self):
+    def test_it_makes_two_plain_queries_and_never_uses_the_plus_syntax(self):
         self.reader.read("activity", 50)
-        argv = self.calls[0]
-        self.assertEqual(argv[0], "journalctl")
-        self.assertIn("--no-pager", argv)
-        self.assertEqual(argv[argv.index("-n") + 1], "50")
-        units = [argv[i + 1] for i, a in enumerate(argv) if a == "-u"]
-        self.assertEqual(units, list(ctl.LOG_UNITS))
-        tags = [argv[i + 1] for i, a in enumerate(argv) if a == "-t"]
-        self.assertEqual(tags, ["hostapd", "dnsmasq", "ghostap"])
-        self.assertEqual(argv.count("+"), 3)
-        self.assertNotIn("-b", argv)
+        self.assertEqual(len(self.calls), 2)
+        for argv in self.calls:
+            self.assertEqual(argv[0], "journalctl")
+            self.assertIn("--no-pager", argv)
+            self.assertEqual(_flags(argv, "-n"), ["50"])
+            self.assertNotIn("+", argv)
+            self.assertNotIn("-b", argv)
+        units, tags = self.calls
+        self.assertEqual(_flags(units, "-u"), list(ctl.LOG_UNITS))
+        self.assertEqual(_flags(units, "-t"), [])
+        self.assertEqual(_flags(tags, "-t"), ["hostapd", "dnsmasq", "ghostap"])
+        self.assertEqual(_flags(tags, "-u"), [])
 
-    def test_the_last_boot_uses_the_previous_boot_only(self):
+    def test_the_last_boot_asks_both_queries_for_the_previous_boot(self):
         self.reader.read("previous_boot", 50)
-        argv = self.calls[0]
-        i = argv.index("-b")
-        self.assertEqual(argv[i + 1], "-1")
+        for argv in self.calls:
+            self.assertEqual(_flags(argv, "-b"), ["-1"])
 
-    def test_lines_come_back_oldest_first_and_trimmed_to_the_count(self):
-        self.answer = (0, "\n".join(f"line {i}" for i in range(100)))
+    def test_the_two_answers_are_merged_in_time_order(self):
+        self.answers = [
+            (0, "2026-11-17T14:00:01-0600 h ghostap[1]: a\n2026-11-17T14:00:05-0600 h ghostap[1]: c"),
+            (0, "2026-11-17T14:00:03-0600 h hostapd[2]: b\n2026-11-17T14:00:09-0600 h hostapd[2]: d")]
+        out = self.reader.read("activity", 50)["lines"]
+        self.assertEqual([ln[-1] for ln in out], ["a", "b", "c", "d"])
+
+    def test_lines_at_the_same_second_keep_their_order(self):
+        stamp = "2026-11-17T14:00:01-0600 h x: "
+        self.answers = [(0, stamp + "1\n" + stamp + "2"), (0, stamp + "3")]
+        self.assertEqual([ln[-1] for ln in self.reader.read("activity")["lines"]], ["1", "2", "3"])
+
+    def test_it_keeps_only_the_newest_lines_after_merging(self):
+        self.answers = [(0, "\n".join(f"2026-11-17T14:00:{i:02d}-0600 h x: {i}" for i in range(0, 60, 2))),
+                        (0, "\n".join(f"2026-11-17T14:00:{i:02d}-0600 h y: {i}" for i in range(1, 60, 2)))]
         out = self.reader.read("activity", 20)["lines"]
-        self.assertEqual((len(out), out[0], out[-1]), (20, "line 80", "line 99"))
+        self.assertEqual((len(out), out[-1][-2:]), (20, "59"))
+        self.assertEqual(out[0][-2:], "40")
 
-    def test_journal_marker_lines_are_dropped(self):
-        self.answer = (0, "-- Boot abc --\nreal line\n-- No entries --")
-        self.assertEqual(self.reader.read("activity")["lines"], ["real line"])
+    def test_one_query_failing_still_shows_the_other(self):
+        self.answers = [(1, "boom"), (0, "2026-11-17T14:00:01-0600 h hostapd[2]: only")]
+        r = self.reader.read("activity")
+        self.assertEqual(len(r["lines"]), 1)
 
-    def test_secrets_are_hidden_and_long_lines_cut(self):
-        self.answer = (0, "x wpa_passphrase=hunter2hunter2 y\n" + "z" * 5000)
-        out = self.reader.read("activity")["lines"]
-        self.assertNotIn("hunter2", out[0])
-        self.assertEqual(len(out[1]), ctl.LOG_MAX_LINE_CHARS)
-
-    def test_a_failure_becomes_a_note_not_an_error(self):
+    def test_both_failing_becomes_a_note_not_an_error(self):
         self.answer = (1, "Failed to open journal: wpa_passphrase=hunter2hunter2")
         r = self.reader.read("activity")
         self.assertEqual(r["lines"], [])
         self.assertIn("Couldn't read the system log", r["note"])
         self.assertNotIn("hunter2", r["note"])
 
+    def test_no_earlier_boot_gets_a_helpful_note(self):
+        self.answer = (1, "No journal boot entry found from the specified boot offset (-1).")
+        note = self.reader.read("previous_boot")["note"]
+        self.assertIn("no earlier boot", note.lower())
+        self.assertIn("persistent", note)
+
+    def test_journal_marker_lines_are_dropped(self):
+        self.answers = [(0, "-- Boot abc --\n2026-11-17T14:00:01-0600 h x: real\n-- No entries --"),
+                        (0, "-- No entries --")]
+        self.assertEqual(len(self.reader.read("activity")["lines"]), 1)
+
+    def test_secrets_are_hidden_and_long_lines_cut(self):
+        stamp = "2026-11-17T14:00:01-0600 h x: "
+        self.answers = [(0, stamp + "wpa_passphrase=hunter2hunter2\n" + stamp + "z" * 5000), (0, "")]
+        out = self.reader.read("activity")["lines"]
+        self.assertNotIn("hunter2", out[0])
+        self.assertEqual(len(out[1]), ctl.LOG_MAX_LINE_CHARS)
+
     def test_an_empty_journal_says_so(self):
         self.answer = (0, "")
         self.assertEqual(self.reader.read("activity")["note"], "Nothing logged yet.")
+
+    @unittest.skipUnless(shutil.which("journalctl"), "journalctl isn't installed here")
+    def test_the_real_journalctl_accepts_these_commands(self):
+        # a mistake in the options is a syntax error even on a machine with no journal
+        import subprocess
+        for prev in (False, True):
+            for argv in ctl._journal_argvs(20, previous_boot=prev):
+                r = subprocess.run(argv, capture_output=True, text=True, timeout=20)
+                self.assertNotRegex(r.stderr + r.stdout,
+                                    r"(?i)can only be used|invalid option|unrecognized|"
+                                    r"unknown|Failed to parse|requires an argument", argv)
 
 
 class FileTests(Rig):

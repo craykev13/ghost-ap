@@ -1891,15 +1891,23 @@ def redact(line: str) -> str:
     return _SECRET_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}********", line)
 
 
-def _journal_argv(lines: int, *, previous_boot: bool = False) -> list[str]:
-    argv = ["journalctl", "--no-pager", "-o", "short-iso", "-n", str(lines)]
+def _journal_argvs(lines: int, *, previous_boot: bool = False) -> list[list[str]]:
+    """Two plain queries (our own units, then the daemons we start, which log under their
+    own names), merged afterwards. One combined query would need journalctl's "+" (OR)
+    syntax, which behaves differently from one systemd version to the next."""
+    base = ["journalctl", "--no-pager", "-o", "short-iso", "-n", str(lines)]
     if previous_boot:
-        argv += ["-b", "-1"]
+        base += ["-b", "-1"]
+    units = list(base)
     for unit in LOG_UNITS:
-        argv += ["-u", unit]
-    # "+" means OR: our own units, or the daemons we start (they log under their own names)
-    argv += ["+", "-t", "hostapd", "+", "-t", "dnsmasq", "+", "-t", "ghostap"]
-    return argv
+        units += ["-u", unit]
+    tags = list(base)
+    for tag in ("hostapd", "dnsmasq", "ghostap"):
+        tags += ["-t", tag]
+    return [units, tags]
+
+
+_STAMP_CHARS = 24           # "2026-11-17T14:03:01-0600": sorts correctly as plain text
 
 
 class LogReader:
@@ -1945,10 +1953,21 @@ class LogReader:
         lines = max(10, min(LOG_MAX_LINES, lines))
         note = ""
         if source in ("activity", "previous_boot"):
-            rc, text = self.runner(_journal_argv(lines, previous_boot=source == "previous_boot"))
-            if rc != 0:
+            results = [self.runner(argv) for argv in _journal_argvs(
+                lines, previous_boot=source == "previous_boot")]
+            good = [text for rc, text in results if rc == 0]
+            if not good and source == "previous_boot" and "boot entry" in results[0][1]:
                 return {"source": source, "lines": [],
-                        "note": "Couldn't read the system log: " + redact(text.strip())[:200]}
+                        "note": "There's no earlier boot in the log. Logs are kept in memory "
+                                "(and lost at reboot) unless persistent logs are turned on; "
+                                "the installer can do that."}
+            if not good:
+                return {"source": source, "lines": [],
+                        "note": "Couldn't read the system log: "
+                                + redact(results[0][1].strip())[:200]}
+            merged = [ln for text in good for ln in text.splitlines() if not ln.startswith("-- ")]
+            merged.sort(key=lambda ln: ln[:_STAMP_CHARS])       # stable: ties keep their order
+            text = "\n".join(merged)
         else:
             path = self.test_log if source == "test" else self.snapshot_log
             try:

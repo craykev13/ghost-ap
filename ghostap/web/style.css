@@ -113,11 +113,24 @@ textarea { min-height: 84px; font: 13px ui-monospace, SFMono-Regular, Menlo, mon
 button.secondary { background: var(--card); color: var(--text); border: 1px solid var(--line); }
 button.secondary:disabled { opacity: .5; cursor: default; }
 
+/* folding sections and the save bar */
+details.fold { padding: 0; gap: 0; }
+details.fold > summary { cursor: pointer; padding: 16px 20px; list-style: none; font-size: 13px;
+  text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 600;
+  display: flex; justify-content: space-between; align-items: center; }
+details.fold > summary::-webkit-details-marker { display: none; }
+details.fold > summary::after { content: "+"; font-size: 18px; }
+details.fold[open] > summary::after { content: "\2212"; }
+details.fold > .group { padding: 0 20px 18px; }
+.actions { position: sticky; bottom: 0; background: var(--bg); padding: 10px 0;
+  border-top: 1px solid var(--line); }
+
 @media (max-width: 720px) {
   .shell { grid-template-columns: 1fr; }
-  .side { flex-direction: row; align-items: center; flex-wrap: wrap; gap: 10px; padding: 10px 12px; }
-  .nav { display: flex; flex: 1; gap: 2px; overflow-x: auto; }
-  .nav-item { padding: 8px 10px; white-space: nowrap; }
+  .side { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 8px 10px; padding: 10px 12px; }
+  .nav { grid-column: 1 / -1; grid-row: 2; display: flex; gap: 6px; }
+  .nav-item { padding: 8px 14px; white-space: nowrap; flex: 1; justify-content: center; }
   .nav-item em { display: none; }
+  button.ghost { padding: 7px 12px; }
   .main { padding: 16px 14px 40px; }
 }

@@ -275,6 +275,7 @@ function renderApply() {
 }
 
 // ---- settings ----
+const narrow = window.matchMedia("(max-width: 720px)");
 const SECTIONS = {
   network: "Network", access_point: "Fallback network (the Pi's own WiFi)",
   dhcp: "Addresses given to devices", recovery: "Safety and recovery",
@@ -411,7 +412,12 @@ function buildForm(data) {
       g.appendChild(c.wrap);
     });
     groups.push(g);
-    body.appendChild(card(SECTIONS[section], g));
+    // a folding section; on a phone only the first two start open so the page isn't endless
+    const d = el("details", "card fold");
+    d.open = !narrow.matches || groups.length <= 2;
+    d.appendChild(el("summary", null, SECTIONS[section]));
+    d.appendChild(g);
+    body.appendChild(d);
   });
   // the cards wrap the groups; hide a whole card when only advanced fields are in it
   form = { version: data.version, controls, groups, saving: false };
@@ -456,7 +462,8 @@ $("settings-view").addEventListener("submit", async (ev) => {
     }
     const fields = (r.data && r.data.fields) || {};
     form.controls.forEach((c) => {
-      if (fields[c.name]) { c.fix.textContent = fields[c.name]; c.wrap.classList.add("invalid"); c.wrap.hidden = false; }
+      if (fields[c.name]) { c.fix.textContent = fields[c.name]; c.wrap.classList.add("invalid"); c.wrap.hidden = false;
+        const d = c.wrap.closest("details"); if (d) d.open = true; }
     });
     const general = fields[""] || (r.data && r.data.error) || "Couldn't save.";
     setMessage(r.status === 409 ? general : "Not saved. " + general, "bad");

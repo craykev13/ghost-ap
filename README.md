@@ -70,5 +70,5 @@ yet; `ghostap preflight` says so instead of guessing.
 
 ## Status
 
-Works and is tested (225 tests, plus real-hardware runs). Planned: changing settings from the
+Works and is tested (an automated test suite, plus real-hardware runs). Planned: changing settings from the
 admin page, link-health checks after the AP-to-client switch, other network setups.

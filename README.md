@@ -41,7 +41,12 @@ Unattended: `sudo python3 install.py --yes --generate-password --ssid MyPi --cou
 A small web page, served by the Pi itself, that shows what it's doing: connected or running
 its own network, addresses, the safety timer and failover. It uses no internet and loads
 nothing from outside. This first version is **read-only**; changing settings from the page
-comes next. It's off by default. To turn it on:
+comes next. The installer offers it: say yes, pick (or generate) an admin password, and it
+installs and enables the page, then prints the address when it finishes. Unattended, use
+`--admin-password-file FILE` or `--generate-admin-password`, and `--no-admin-page` to skip it.
+`ghostap status` shows the address too.
+
+To set it up by hand instead:
 
 ```
 sudo ghostap gui-password                                  # choose the admin password
@@ -50,7 +55,7 @@ sudo cp ~/ghost-ap/systemd/ghostap-gui.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now ghostap-gui
 ```
 
-Then open `http://<hostname>.local:8480` (for example `http://zerofi.local:8480`) or the Pi's
+Open `http://<hostname>.local:8480` (for example `http://zerofi.local:8480`) or the Pi's
 IP address with `:8480`. When the Pi is running its own network, that's `http://192.168.4.1:8480`.
 The port and listen address are settings under `[gui]`. Sign-in is rate-limited, the page runs
 sandboxed (almost every privilege removed, rest of the system read-only), and it is plain HTTP,

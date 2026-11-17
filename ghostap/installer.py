@@ -58,6 +58,10 @@ PASSPHRASE = f"{CONF_DIR}/passphrase"
 LINK = "/usr/local/bin/ghostap"
 SERVICE = "/etc/systemd/system/ghostap.service"
 DISPATCHER = "/etc/NetworkManager/dispatcher.d/90-ghostap"
+GUI_PASSWORD = f"{CONF_DIR}/gui-password"
+GUI_SERVICE = "/etc/systemd/system/ghostap-gui.service"
+GUI_UNIT = "ghostap-gui.service"
+DEFAULT_GUI_PORT = 8480
 JOURNAL = "/etc/systemd/journald.conf.d/99-persistent.conf"
 STATE_DIR = "/var/lib/ghostap"
 MANIFEST = f"{STATE_DIR}/install-manifest.json"
@@ -193,6 +197,10 @@ class Choices:
     hostapd_debug: bool = False
     disable_legacy: bool = True          # turn off the old wifi-or-ap.service if enabled
     disable_system_daemons: bool = True  # turn off a stray system hostapd/dnsmasq service
+    admin_page: bool = False             # install the web admin page (the questions turn it on)
+    admin_password: str | None = None    # None = keep the admin password that is there
+    admin_generated: bool = False        # True when WE made the admin password up
+    gui_port: int = DEFAULT_GUI_PORT
 
 
 @dataclass
@@ -252,6 +260,10 @@ def render_config(c: Choices) -> str:
     lines += ["", "[dhcp]", f"start = {_toml_str(str(first))}", f"end = {_toml_str(str(last))}"]
     if c.failover:
         lines += ["", "[recovery]", f"failover_grace = {c.failover_grace}"]
+    if c.admin_page:
+        lines += ["", "[gui]", "enabled = true"]
+        if c.gui_port != DEFAULT_GUI_PORT:
+            lines.append(f"port = {c.gui_port}")
     return "\n".join(lines) + "\n"
 
 
@@ -353,15 +365,20 @@ def build_plan(host: Host, c: Choices, facts, findings, repo: Path = REPO) -> Pl
     if c.boot_service:
         unit = (repo / "systemd" / "ghostap.service").read_bytes()
         same = _same_file(host, SERVICE, unit, 0o644)
+        unit_changed = not same
         add(Step("file", SERVICE, f"Install the boot service {SERVICE}", data=unit, mode=0o644,
                  status="same" if same else "replace" if host.exists(SERVICE) else "new"))
-        if not same:
+        if c.admin_page:
+            unit_changed = _plan_admin_unit(host, c, plan, repo) or unit_changed
+        if unit_changed:
             add(Step("cmd", "systemd", "Reload systemd", cmd=("systemctl", "daemon-reload")))
         enabled = host.run(("systemctl", "is-enabled", "ghostap.service"), check=False)[1]
         add(Step("cmd", "ghostap.service", "Enable GhostAP at boot (it does not start now)",
                  cmd=("systemctl", "enable", "ghostap.service"),
                  undo=("systemctl", "disable", "ghostap.service"),
                  status="same" if enabled.startswith("enabled") else "new"))
+        if c.admin_page:
+            _plan_admin_enable(host, c, plan)
         legacy_on = host.run(("systemctl", "is-enabled", LEGACY_SERVICE),
                              check=False)[1].startswith("enabled")
         if legacy_on and c.disable_legacy:
@@ -370,6 +387,10 @@ def build_plan(host: Host, c: Choices, facts, findings, repo: Path = REPO) -> Pl
                      "takes effect next boot)",
                      cmd=("systemctl", "disable", LEGACY_SERVICE),
                      undo=("systemctl", "enable", LEGACY_SERVICE), check=False))
+    if c.admin_page and not c.boot_service:
+        if _plan_admin_unit(host, c, plan, repo):
+            add(Step("cmd", "systemd", "Reload systemd", cmd=("systemctl", "daemon-reload")))
+        _plan_admin_enable(host, c, plan)
     if c.failover:
         hook = (repo / "nm-dispatcher" / "90-ghostap").read_bytes()
         same = _same_file(host, DISPATCHER, hook, 0o755)
@@ -400,6 +421,76 @@ def build_plan(host: Host, c: Choices, facts, findings, repo: Path = REPO) -> Pl
                           "because deleting it can't be undone. If you don't use it: "
                           "sudo nmcli connection delete '<name>'")
     return plan
+
+
+def _plan_admin_unit(host: Host, c: Choices, plan: Plan, repo: Path) -> bool:
+    """The service file and the admin password. (Enabling/starting comes after the reload.)
+    Returns True when the service file itself is new or changed, i.e. systemd must reload."""
+    ctl = _controller()
+    gui = ctl._gui_module()
+    unit = (repo / "systemd" / "ghostap-gui.service").read_bytes()
+    unit_same = _same_file(host, GUI_SERVICE, unit, 0o644)
+    plan.steps.append(Step(
+        "file", GUI_SERVICE, f"Install the admin page service {GUI_SERVICE}", data=unit,
+        mode=0o644, status="same" if unit_same
+        else "replace" if host.exists(GUI_SERVICE) else "new"))
+    exists = host.exists(GUI_PASSWORD)
+    if c.admin_password is not None:
+        err = check_admin_password(c.admin_password)
+        if err:
+            raise InstallError(err)
+        stored = host.read(GUI_PASSWORD).decode().strip() if exists else ""
+        if exists and gui.verify_password(c.admin_password, stored) \
+                and host.mode(GUI_PASSWORD) == 0o600:
+            plan.steps.append(Step("file", GUI_PASSWORD, f"Keep the admin password in "
+                                   f"{GUI_PASSWORD}", status="same", keep_on_uninstall=True))
+        else:
+            data = (gui.hash_password(c.admin_password) + "\n").encode()
+            plan.steps.append(Step(
+                "file", GUI_PASSWORD, f"Save the admin page password in {GUI_PASSWORD} "
+                "(stored scrambled, mode 600)", data=data, mode=0o600, secret=True,
+                keep_on_uninstall=True, status="replace" if exists else "new"))
+    elif not exists:
+        raise InstallError(f"no admin password given and {GUI_PASSWORD} doesn't exist yet")
+    else:
+        plan.steps.append(Step("file", GUI_PASSWORD, f"Keep the existing admin password in "
+                               f"{GUI_PASSWORD}", status="same", keep_on_uninstall=True))
+    if c.keep_config and host.exists(CONF) and not _config_gui_enabled(host):
+        plan.notes.append("The admin page is off in your existing config. To turn it on, add "
+                          f"`enabled = true` under [gui] in {CONF}.")
+    return not unit_same
+
+
+def _plan_admin_enable(host: Host, c: Choices, plan: Plan) -> None:
+    changed = any(s.status != "same" for s in plan.steps
+                  if s.target in (GUI_SERVICE, GUI_PASSWORD, CONF))
+    enabled = host.run(("systemctl", "is-enabled", GUI_UNIT), check=False)[1]
+    plan.steps.append(Step(
+        "cmd", GUI_UNIT, "Enable the admin page at boot",
+        cmd=("systemctl", "enable", GUI_UNIT), undo=("systemctl", "disable", "--now", GUI_UNIT),
+        status="same" if enabled.startswith("enabled") else "new"))
+    if changed:
+        plan.steps.append(Step("cmd", GUI_UNIT, "(Re)start the admin page so it picks this up",
+                               cmd=("systemctl", "restart", GUI_UNIT), check=False))
+
+
+def check_admin_password(p: str) -> str | None:
+    gui = _controller()._gui_module()
+    if not (gui.MIN_PASSWORD <= len(p) <= gui.MAX_PASSWORD) or not p.isprintable():
+        return f"the admin password must be {gui.MIN_PASSWORD}-{gui.MAX_PASSWORD} characters"
+    return None
+
+
+def generate_admin_password() -> str:
+    return generate_passphrase()
+
+
+def _config_gui_enabled(host: Host) -> bool:
+    try:
+        raw = tomllib.loads(host.read(CONF).decode())
+    except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError):
+        return False
+    return raw.get("gui", {}).get("enabled") is True
 
 
 def _config_has_failover(host: Host) -> bool:
@@ -557,7 +648,9 @@ def uninstall(host: Host, *, remove_config: bool = False, force: bool = False,
             if e.get("undo"):
                 host.run(tuple(e["undo"]), check=False)
                 say(f"undid: {' '.join(e['cmd'])}")
-        elif kind in ("file", "link") and action == "unchanged":
+        elif kind in ("file", "link") and action == "unchanged" \
+                and not (e.get("keep_on_uninstall") and remove_config):
+            # (your own settings are the exception: --remove-config means exactly that)
             kept.append(f"{target} (was already there before the installer)")
         elif kind in ("file", "link"):
             if e.get("keep_on_uninstall") and not remove_config:
@@ -675,12 +768,14 @@ def interview(io: IO, host: Host, facts, defaults: Choices | None = None,
     ov = overrides or {}
     has_conf = host.exists(CONF)
     has_pass = host.exists(PASSPHRASE)
+    has_gui_pw = host.exists(GUI_PASSWORD)
 
     def given(k):
         return k in ov and ov[k] is not None
 
     for k in ("ssid", "country", "failover", "failover_grace", "boot_service",
-              "persistent_journal", "hostapd_debug", "keep_config", "passphrase", "generated"):
+              "persistent_journal", "hostapd_debug", "keep_config", "passphrase", "generated",
+              "admin_page", "admin_password", "admin_generated"):
         if given(k):
             setattr(c, k, ov[k])
 
@@ -694,6 +789,9 @@ def interview(io: IO, host: Host, facts, defaults: Choices | None = None,
                                "--passphrase-file FILE")
         if not given("country") and facts.reg_country not in (None, "00"):
             c.country = facts.reg_country
+        if not given("admin_page"):
+            # unattended: only switch the page on if a password is available for it
+            c.admin_page = c.admin_password is not None or has_gui_pw
         return c
 
     io.say()
@@ -745,7 +843,50 @@ def interview(io: IO, host: Host, facts, defaults: Choices | None = None,
         c.persistent_journal = io.yes_no(
             "Keep system logs across reboots? (helps troubleshooting; Pi OS keeps them in "
             "RAM by default)", False)
+    if not given("admin_page"):
+        c.admin_page = io.yes_no("Install the admin web page? (a status page you open in a "
+                                 "browser; password protected, works offline)", True)
+    if c.admin_page and c.admin_password is None:
+        opts = [("type", "Type a password"), ("gen", "Make a random one for me")]
+        if has_gui_pw:
+            opts.append(("keep", f"Keep the existing one in {GUI_PASSWORD}"))
+        how = io.choose("Password for the admin page?", opts, 3 if has_gui_pw else 1)
+        if how == "type":
+            while True:
+                p1 = io.secret("  Admin page password (8+ characters, hidden): ")
+                err = check_admin_password(p1)
+                if err:
+                    io.say(f"  {err}")
+                elif p1 != io.secret("  Type it again: "):
+                    io.say("  those didn't match")
+                else:
+                    c.admin_password = p1
+                    break
+        elif how == "gen":
+            c.admin_password, c.admin_generated = generate_admin_password(), True
     return c
+
+
+def admin_page_lines(host: Host) -> list[str]:
+    """Where to open the admin page, read from the config that is actually installed."""
+    try:
+        raw = tomllib.loads(host.read(CONF).decode())
+    except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError):
+        return []
+    gui = raw.get("gui", {})
+    if gui.get("enabled") is not True or not host.exists(GUI_SERVICE):
+        return []
+    port = gui.get("port", DEFAULT_GUI_PORT)
+    name = host.run(("hostname",), check=False)[1].strip().lower()
+    ips = [x for x in host.run(("hostname", "-I"), check=False)[1].split()
+           if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", x)]
+    gateway = str(raw.get("access_point", {}).get("address", "192.168.4.1/24")).split("/")[0]
+    urls = ([f"http://{name}.local:{port}"] if name else []) + [f"http://{ip}:{port}" for ip in ips]
+    out = ["", "Admin page:  " + (urls[0] if urls else f"http://<this Pi's address>:{port}")]
+    out += [f"             {u}" for u in urls[1:]]
+    out.append(f"  (when the Pi is running its own network: http://{gateway}:{port})")
+    out.append("  Sign in with the admin password you set.")
+    return out
 
 
 def explain_findings(io: IO, findings) -> None:
@@ -797,6 +938,11 @@ def run(argv=None, *, io: IO | None = None, host: Host | None = None, shell=None
     ap.add_argument("--failover-grace", type=int)
     ap.add_argument("--no-boot-service", dest="boot_service", action="store_false", default=None)
     ap.add_argument("--persistent-journal", action="store_true", default=None)
+    ap.add_argument("--no-admin-page", dest="admin_page", action="store_false", default=None,
+                    help="don't install the admin web page")
+    ap.add_argument("--admin-password-file", type=Path,
+                    help="read the admin page password from this file")
+    ap.add_argument("--generate-admin-password", action="store_true")
     ap.add_argument("--interface", default="wlan0")
     args = ap.parse_args(argv)
 
@@ -822,6 +968,14 @@ def run(argv=None, *, io: IO | None = None, host: Host | None = None, shell=None
         if not args.dry_run and not root_ok:
             raise InstallError("run it with sudo: sudo python3 install.py")
 
+        admin_pw, admin_generated = None, False
+        if args.admin_password_file:
+            try:
+                admin_pw = args.admin_password_file.read_text().strip()
+            except OSError as e:
+                raise InstallError(f"can't read {args.admin_password_file}: {e}")
+        elif args.generate_admin_password:
+            admin_pw, admin_generated = generate_admin_password(), True
         passphrase, generated = None, False
         if args.passphrase_file:
             try:
@@ -836,7 +990,9 @@ def run(argv=None, *, io: IO | None = None, host: Host | None = None, shell=None
                      "boot_service": args.boot_service,
                      "persistent_journal": args.persistent_journal,
                      "keep_config": args.keep_config, "passphrase": passphrase,
-                     "generated": generated or None}
+                     "generated": generated or None,
+                     "admin_page": args.admin_page, "admin_password": admin_pw,
+                     "admin_generated": admin_generated or None}
         choices = interview(io, host, facts, Choices(interface=args.interface), overrides,
                             assume_yes=args.yes)
         plan = build_plan(host, choices, facts, findings)
@@ -861,6 +1017,11 @@ def run(argv=None, *, io: IO | None = None, host: Host | None = None, shell=None
         if choices.generated and choices.passphrase:
             io.say(f"The fallback network is {choices.ssid!r}, password: {choices.passphrase}")
             io.say(f"(Write it down. It's saved in {PASSPHRASE}.)")
+        if choices.admin_generated and choices.admin_password:
+            io.say(f"The admin page password is: {choices.admin_password}")
+            io.say(f"(Write it down. Only a scrambled copy is saved, in {GUI_PASSWORD}.)")
+        for line in admin_page_lines(host):
+            io.say(line)
         io.say("")
         io.say("Next steps (nothing has touched your live WiFi yet):")
         io.say("  1. sudo ghostap preflight        # re-check the system")

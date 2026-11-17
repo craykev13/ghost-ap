@@ -38,11 +38,14 @@ inst._controller = lambda: ctl
 class Runner:
     """Stands in for running commands. Records them; answers is-enabled from a table."""
 
-    def __init__(self, enabled=None, fail=()):
+    def __init__(self, enabled=None, fail=(), outputs=None):
         self.calls, self.enabled, self.fail = [], dict(enabled or {}), list(fail)
+        self.outputs = dict(outputs or {})
 
     def __call__(self, cmd, env=None):
         self.calls.append(tuple(cmd))
+        if tuple(cmd) in self.outputs:
+            return 0, self.outputs[tuple(cmd)]
         if cmd[:2] == ("systemctl", "is-enabled"):
             state = self.enabled.get(cmd[2], "disabled")
             return (0 if state == "enabled" else 1), state
@@ -490,6 +493,20 @@ class UninstallTests(Rig):
         inst.uninstall(self.host, remove_config=True, say=self.say)
         self.assertEqual(self.tree(), before)
 
+    def test_remove_config_removes_your_settings_even_if_they_were_already_there(self):
+        self.host.write(inst.CONF, b"# mine\n", 0o644)
+        self.host.write(inst.PASSPHRASE, b"already-set\n", 0o600)
+        plan, c = self.plan(inst.Choices(keep_config=True))
+        inst.apply_plan(self.host, plan, c)
+        inst.uninstall(self.host, say=self.say)
+        self.assertTrue(self.host.exists(inst.CONF))              # kept by default
+        self.assertTrue(self.host.exists(inst.PASSPHRASE))
+        plan, c = self.plan(inst.Choices(keep_config=True))
+        inst.apply_plan(self.host, plan, c)
+        inst.uninstall(self.host, remove_config=True, say=self.say)   # but you asked
+        self.assertFalse(self.host.exists(inst.CONF))
+        self.assertFalse(self.host.exists(inst.PASSPHRASE))
+
     def test_nothing_to_uninstall_is_said_plainly(self):
         self.assertEqual(inst.uninstall(self.host, say=self.say), 1)
         self.assertIn("Nothing to uninstall", "\n".join(self.said))
@@ -591,7 +608,7 @@ class CommandLineTests(Rig):
 class InteractiveTests(Rig):
     def test_the_questions_and_the_summary_before_anything_changes(self):
         rc, out = self.run_cli(
-            [], answers=["MyZero", "1", "gb", "2", "60", "y", "n", "y"],
+            [], answers=["MyZero", "1", "gb", "2", "60", "y", "n", "n", "y"],
             secrets=["hunter22hunter", "hunter22hunter"])
         self.assertEqual(rc, 0, out)
         cfg = ctl.load_config(self.path(inst.CONF), secrets=False)
@@ -603,7 +620,7 @@ class InteractiveTests(Rig):
 
     def test_bad_answers_are_asked_again(self):
         rc, out = self.run_cli(
-            [], answers=["x" * 40, "ZeroFi", "1", "USA", "us", "2", "5", "30", "y", "n", "y"],
+            [], answers=["x" * 40, "ZeroFi", "1", "USA", "us", "2", "5", "30", "y", "n", "n", "y"],
             secrets=["short", "longenough1", "mismatch22", "longenough1", "longenough1"])
         self.assertEqual(rc, 0, out)
         self.assertIn("1 to 32 characters", out)
@@ -614,7 +631,7 @@ class InteractiveTests(Rig):
         self.assertEqual(self.host.read(inst.PASSPHRASE), b"longenough1\n")
 
     def test_making_up_a_password_shows_it_once_at_the_end(self):
-        rc, out = self.run_cli([], answers=["", "2", "", "2", "", "y", "n", "y"])
+        rc, out = self.run_cli([], answers=["", "2", "", "2", "", "y", "n", "n", "y"])
         self.assertEqual(rc, 0, out)
         saved = self.host.read(inst.PASSPHRASE).decode().strip()
         self.assertEqual(out.count(saved), 1)
@@ -622,7 +639,7 @@ class InteractiveTests(Rig):
 
     def test_saying_no_at_the_summary_changes_nothing(self):
         before = self.tree()
-        rc, out = self.run_cli([], answers=["", "2", "", "2", "", "y", "n", "n"])
+        rc, out = self.run_cli([], answers=["", "2", "", "2", "", "y", "n", "n", "n"])
         self.assertEqual(rc, 0)
         self.assertEqual(self.tree(), before)
         self.assertIn("Cancelled. Nothing was changed.", out)
@@ -637,7 +654,7 @@ class InteractiveTests(Rig):
     def test_existing_config_offers_to_keep_it_and_skips_the_rest(self):
         self.host.write(inst.CONF, b"# mine\n", 0o644)
         self.host.write(inst.PASSPHRASE, b"already-set\n", 0o600)
-        rc, out = self.run_cli([], answers=["1", "y", "n", "y"])
+        rc, out = self.run_cli([], answers=["1", "y", "n", "n", "y"])
         self.assertEqual(rc, 0, out)
         self.assertEqual(self.host.read(inst.CONF), b"# mine\n")
         self.assertNotIn("SSID", out.split("Found an existing")[1].split("Here's")[0])
@@ -645,7 +662,7 @@ class InteractiveTests(Rig):
     def test_an_existing_password_can_be_kept_when_rewriting_the_config(self):
         self.host.write(inst.CONF, b"# old\n", 0o644)
         self.host.write(inst.PASSPHRASE, b"already-set\n", 0o600)
-        rc, out = self.run_cli([], answers=["2", "NewOne", "3", "", "2", "", "y", "n", "y"])
+        rc, out = self.run_cli([], answers=["2", "NewOne", "3", "", "2", "", "y", "n", "n", "y"])
         self.assertEqual(rc, 0, out)
         self.assertEqual(self.host.read(inst.PASSPHRASE), b"already-set\n")
         self.assertIn(b"NewOne", self.host.read(inst.CONF))
@@ -655,6 +672,319 @@ class InteractiveTests(Rig):
         io = inst.IO(lambda prompt: next(answers), None, self.said.append)
         self.assertEqual(io.choose("Pick", [("a", "A"), ("b", "B")], default=2), "b")
         self.assertEqual(sum("type a number" in s for s in self.said), 2)
+
+
+class AdminPageInstallTests(Rig):
+    ADMIN = "adminpass123"
+
+    def choices(self, **kw):
+        base = dict(passphrase="correct horse", admin_page=True, admin_password=self.ADMIN)
+        base.update(kw)
+        return inst.Choices(**base)
+
+    def gui(self):
+        return ctl._gui_module()
+
+    def enable_everything(self):
+        self.runner.enabled.update({"ghostap.service": "enabled", inst.GUI_UNIT: "enabled"})
+
+    def test_the_page_is_off_unless_asked_for(self):
+        plan, _ = self.plan(inst.Choices(passphrase="correct horse"))
+        self.assertFalse({inst.GUI_SERVICE, inst.GUI_PASSWORD, inst.GUI_UNIT}
+                         & {s.target for s in plan.steps})
+        self.assertNotIn("[gui]", inst.render_config(inst.Choices()))
+
+    def test_fresh_install_gets_the_unit_a_scrambled_password_and_the_config_switch(self):
+        self.install()
+        h = self.host
+        self.assertEqual(h.read(inst.GUI_SERVICE),
+                         (ROOT / "systemd/ghostap-gui.service").read_bytes())
+        stored = h.read(inst.GUI_PASSWORD).decode()
+        self.assertTrue(self.gui().verify_password(self.ADMIN, stored))
+        self.assertNotIn(self.ADMIN, stored)
+        self.assertEqual(h.mode(inst.GUI_PASSWORD), 0o600)
+        cfg = ctl.load_config(self.path(inst.CONF), secrets=False)
+        self.assertTrue(cfg.gui_enabled)
+        self.assertEqual(cfg.gui_port, 8480)
+        self.assertTrue(self.runner.ran("systemctl", "enable", inst.GUI_UNIT))
+        self.assertTrue(self.runner.ran("systemctl", "restart", inst.GUI_UNIT))
+
+    def test_one_reload_covers_both_service_files_and_comes_before_enabling(self):
+        self.install()
+        reloads = [i for i, c in enumerate(self.runner.calls) if c == ("systemctl", "daemon-reload")]
+        enables = [i for i, c in enumerate(self.runner.calls) if c[:2] == ("systemctl", "enable")]
+        self.assertEqual(len(reloads), 1)
+        self.assertLess(reloads[0], min(enables))
+
+    def test_without_the_boot_service_a_changed_page_unit_still_reloads_systemd(self):
+        self.install(self.choices(boot_service=False))
+        self.enable_everything()
+        self.path(inst.GUI_SERVICE).write_text("# edited\n")
+        plan, _ = self.plan(self.choices(boot_service=False))
+        self.assertTrue(any(s.cmd == ("systemctl", "daemon-reload") for s in plan.steps))
+
+    def test_the_page_works_without_the_boot_service_too(self):
+        self.install(self.choices(boot_service=False))
+        self.assertTrue(self.host.exists(inst.GUI_SERVICE))
+        self.assertFalse(self.host.exists(inst.SERVICE))
+        self.assertTrue(self.runner.ran("systemctl", "daemon-reload"))
+        self.assertTrue(self.runner.ran("systemctl", "enable", inst.GUI_UNIT))
+
+    def test_the_page_is_only_started_by_a_restart_and_only_when_something_changed(self):
+        self.install()
+        for c in self.runner.calls:
+            if "--now" in c:
+                self.fail(f"started something at install time: {c}")
+        self.enable_everything()
+        self.runner.calls.clear()
+        plan, c = self.plan()
+        self.assertEqual(plan.changes(), [])
+        inst.apply_plan(self.host, plan, c)
+        self.assertFalse(self.runner.ran("systemctl", "restart"))
+
+    def test_a_new_password_restarts_the_page_and_the_same_one_does_not_rewrite(self):
+        self.install()
+        self.enable_everything()
+        before = self.host.read(inst.GUI_PASSWORD)
+        plan, _ = self.plan()
+        step = next(s for s in plan.steps if s.target == inst.GUI_PASSWORD)
+        self.assertEqual(step.status, "same")                       # same password: no churn
+        plan, c = self.plan(self.choices(admin_password="a different one"))
+        step = next(s for s in plan.steps if s.target == inst.GUI_PASSWORD)
+        self.assertEqual(step.status, "replace")
+        self.assertTrue(any(s.cmd[:2] == ("systemctl", "restart") for s in plan.steps))
+        inst.apply_plan(self.host, plan, c)
+        self.assertNotEqual(self.host.read(inst.GUI_PASSWORD), before)
+        self.assertTrue(self.gui().verify_password("a different one",
+                                                   self.host.read(inst.GUI_PASSWORD).decode()))
+
+    def test_a_world_readable_admin_password_file_gets_fixed(self):
+        self.install()
+        self.enable_everything()
+        os.chmod(self.path(inst.GUI_PASSWORD), 0o644)
+        plan, c = self.plan()
+        step = next(s for s in plan.steps if s.target == inst.GUI_PASSWORD)
+        self.assertEqual(step.status, "replace")
+        inst.apply_plan(self.host, plan, c)
+        self.assertEqual(self.host.mode(inst.GUI_PASSWORD), 0o600)
+
+    def test_a_changed_page_service_file_alone_triggers_a_systemd_reload(self):
+        self.install()
+        self.enable_everything()
+        self.path(inst.GUI_SERVICE).write_text("# edited\n")          # boot service untouched
+        plan, c = self.plan()
+        self.assertEqual([s.target for s in plan.changes() if s.kind == "file"], [inst.GUI_SERVICE])
+        self.assertTrue(any(s.cmd == ("systemctl", "daemon-reload") for s in plan.steps))
+        self.assertTrue(any(s.cmd[:2] == ("systemctl", "restart") for s in plan.steps))
+
+    def test_keeping_the_existing_admin_password(self):
+        self.install()
+        self.enable_everything()
+        plan, _ = self.plan(self.choices(admin_password=None))
+        self.assertEqual(next(s for s in plan.steps if s.target == inst.GUI_PASSWORD).status, "same")
+
+    def test_a_missing_or_weak_admin_password_is_an_error(self):
+        with self.assertRaises(inst.InstallError):
+            self.plan(self.choices(admin_password=None))
+        for bad in ("short", "x" * 200, "has\nnewline123"):
+            with self.assertRaises(inst.InstallError, msg=bad):
+                self.plan(self.choices(admin_password=bad))
+
+    def test_a_pi_set_up_by_hand_is_already_in_place(self):
+        """What the real ZeroFi looked like before the installer knew about the page."""
+        self.host.mkdir("/var/lib/ghostap")                 # snapshots already live here
+        self.host.write(inst.CONF, b'[gui]\nenabled = true\n', 0o644)
+        self.host.write(inst.PASSPHRASE, b"already-set\n", 0o600)
+        self.host.write(inst.GUI_PASSWORD,
+                        (self.gui().hash_password("x" * 10, iterations=1000) + "\n").encode(), 0o600)
+        self.host.write(inst.GUI_SERVICE, (ROOT / "systemd/ghostap-gui.service").read_bytes(), 0o644)
+        self.host.write(inst.SERVICE, (ROOT / "systemd/ghostap.service").read_bytes(), 0o644)
+        self.host.write(inst.DISPATCHER, (ROOT / "nm-dispatcher/90-ghostap").read_bytes(), 0o755)
+        self.host.symlink(inst.LINK, str(ROOT / "ghostap" / "controller.py"))
+        self.enable_everything()
+        plan, _ = self.plan(inst.Choices(keep_config=True, admin_page=True))
+        self.assertEqual(plan.changes(), [])
+        self.assertEqual(plan.notes and [n for n in plan.notes if "admin page is off" in n], [])
+
+    def test_a_kept_config_without_the_page_switch_gets_a_note_not_an_edit(self):
+        self.host.write(inst.CONF, b"# mine\n", 0o644)
+        self.host.write(inst.PASSPHRASE, b"already-set\n", 0o600)
+        plan, c = self.plan(inst.Choices(keep_config=True, admin_page=True,
+                                         admin_password=self.ADMIN))
+        self.assertIn("[gui]", " ".join(plan.notes))
+        inst.apply_plan(self.host, plan, c)
+        self.assertEqual(self.host.read(inst.CONF), b"# mine\n")
+
+    def test_a_custom_port_goes_into_the_config(self):
+        cfg = ctl.load_config(self._write(inst.render_config(
+            inst.Choices(admin_page=True, gui_port=9000))), secrets=False)
+        self.assertEqual((cfg.gui_enabled, cfg.gui_port), (True, 9000))
+
+    def _write(self, text):
+        p = self.tmp / "c.toml"
+        p.write_text(text)
+        return p
+
+    def test_uninstall_stops_and_removes_the_page_but_keeps_its_password(self):
+        self.install()
+        self.runner.calls.clear()
+        inst.uninstall(self.host, say=lambda m: None)
+        self.assertTrue(self.runner.ran("systemctl", "disable", "--now", inst.GUI_UNIT))
+        self.assertFalse(self.host.exists(inst.GUI_SERVICE))
+        self.assertTrue(self.host.exists(inst.GUI_PASSWORD))
+        inst.uninstall(self.host, say=lambda m: None)            # nothing left to do
+        self.install()
+        inst.uninstall(self.host, remove_config=True, say=lambda m: None)
+        self.assertFalse(self.host.exists(inst.GUI_PASSWORD))
+
+    def test_uninstall_leaves_a_hand_installed_page_alone(self):
+        self.host.write(inst.GUI_SERVICE, (ROOT / "systemd/ghostap-gui.service").read_bytes(), 0o644)
+        self.host.write(inst.CONF, b'[gui]\nenabled = true\n', 0o644)
+        self.host.write(inst.PASSPHRASE, b"already-set\n", 0o600)
+        self.host.write(inst.GUI_PASSWORD,
+                        (self.gui().hash_password("x" * 10, iterations=1000) + "\n").encode(), 0o600)
+        self.enable_everything()
+        plan, c = self.plan(inst.Choices(keep_config=True, admin_page=True))
+        inst.apply_plan(self.host, plan, c)
+        self.runner.calls.clear()
+        inst.uninstall(self.host, say=lambda m: None)
+        self.assertTrue(self.host.exists(inst.GUI_SERVICE))
+        self.assertFalse(self.runner.ran("systemctl", "disable", "--now", inst.GUI_UNIT))
+
+
+class AdminPageCommandLineTests(Rig):
+    IPS = {("hostname",): "ZeroFi\n", ("hostname", "-I"): "192.168.1.50 fe80::1 172.20.10.4 \n"}
+
+    def setUp(self):
+        super().setUp()
+        self.mk_host(outputs=self.IPS)
+
+    def test_unattended_install_can_make_a_password_and_shows_it_once_with_the_addresses(self):
+        rc, out = self.run_cli(["--yes", "--generate-password", "--generate-admin-password"])
+        self.assertEqual(rc, 0, out)
+        gui = ctl._gui_module()
+        stored = self.host.read(inst.GUI_PASSWORD).decode()
+        shown = re.search(r"admin page password is: (\S+)", out).group(1)
+        self.assertTrue(gui.verify_password(shown, stored))
+        self.assertEqual(out.count(shown), 1)
+        self.assertNotIn(shown, self.host.read(inst.CONF).decode())
+        self.assertIn("http://zerofi.local:8480", out)
+        self.assertIn("http://192.168.1.50:8480", out)
+        self.assertIn("http://172.20.10.4:8480", out)
+        self.assertNotIn("fe80", out)
+        self.assertIn("http://192.168.4.1:8480", out)               # its own network
+        self.assertLess(out.index("Done."), out.index("Admin page:"))
+
+    def test_a_chosen_admin_password_is_never_echoed(self):
+        pw = self.tmp / "adminpw"
+        pw.write_text("my admin secret\n")
+        rc, out = self.run_cli(["--yes", "--generate-password", "--admin-password-file", str(pw)])
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("my admin secret", out)
+        self.assertTrue(ctl._gui_module().verify_password(
+            "my admin secret", self.host.read(inst.GUI_PASSWORD).decode()))
+        self.assertNotIn("admin page password is", out)
+
+    def test_unattended_without_any_admin_password_leaves_the_page_off(self):
+        rc, out = self.run_cli(["--yes", "--generate-password"])
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(self.host.exists(inst.GUI_SERVICE))
+        self.assertNotIn("Admin page:", out)
+        self.assertNotIn("[gui]", self.host.read(inst.CONF).decode())
+
+    def test_no_admin_page_wins_over_everything(self):
+        rc, out = self.run_cli(["--yes", "--generate-password", "--generate-admin-password",
+                                "--no-admin-page"])
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(self.host.exists(inst.GUI_SERVICE))
+        self.assertFalse(self.host.exists(inst.GUI_PASSWORD))
+
+    def test_an_existing_admin_password_is_enough_for_unattended_runs(self):
+        self.run_cli(["--yes", "--generate-password", "--generate-admin-password"])
+        self.said.clear()
+        rc, out = self.run_cli(["--yes"])
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(self.host.exists(inst.GUI_SERVICE))
+        self.assertNotIn("admin page password is", out)
+
+    def test_a_bad_admin_password_file_stops_everything_before_any_change(self):
+        pw = self.tmp / "short"
+        pw.write_text("abc\n")
+        before = self.tree()
+        rc, out = self.run_cli(["--yes", "--generate-password", "--admin-password-file", str(pw)])
+        self.assertEqual(rc, 1)
+        self.assertIn("admin password", out)
+        self.assertEqual(self.tree(), before)
+
+    def test_dry_run_with_the_page_changes_nothing(self):
+        before = self.tree()
+        rc, out = self.run_cli(["--dry-run", "--yes", "--generate-password",
+                                "--generate-admin-password"], root=False)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.tree(), before)
+        self.assertIn("admin page service", out)
+        self.assertNotIn("Admin page:  http", out)         # addresses only after a real install
+
+    def test_the_address_comes_from_the_installed_config(self):
+        self.run_cli(["--yes", "--generate-password", "--generate-admin-password"])
+        conf = self.host.read(inst.CONF).decode() + 'port = 9100\n'
+        conf = conf.replace('enabled = true', 'enabled = true')
+        self.host.write(inst.CONF, conf.encode(), 0o644)
+        lines = "\n".join(inst.admin_page_lines(self.host))
+        self.assertIn(":9100", lines)
+        self.assertNotIn(":8480", lines)
+
+    def test_no_addresses_are_shown_when_the_page_is_off(self):
+        self.host.write(inst.CONF, b'[gui]\nenabled = false\n', 0o644)
+        self.host.write(inst.GUI_SERVICE, b"x", 0o644)
+        self.assertEqual(inst.admin_page_lines(self.host), [])
+        self.host.write(inst.CONF, b'[gui]\nenabled = true\n', 0o644)
+        self.host.remove(inst.GUI_SERVICE)
+        self.assertEqual(inst.admin_page_lines(self.host), [])
+        self.host.remove(inst.CONF)
+        self.assertEqual(inst.admin_page_lines(self.host), [])
+
+    def test_when_the_name_or_addresses_are_unknown_it_still_says_what_to_do(self):
+        self.mk_host(outputs={})
+        self.host.write(inst.CONF, b'[gui]\nenabled = true\n', 0o644)
+        self.host.write(inst.GUI_SERVICE, b"x", 0o644)
+        text = "\n".join(inst.admin_page_lines(self.host))
+        self.assertIn("http://<this Pi's address>:8480", text)
+        self.assertIn("http://192.168.4.1:8480", text)
+
+    def test_interactive_typed_admin_password(self):
+        rc, out = self.run_cli(
+            [], answers=["", "2", "", "2", "", "y", "n", "y", "1", "y"],
+            secrets=["short", "adminpass123", "mismatch123", "adminpass123", "adminpass123"])
+        self.assertEqual(rc, 0, out)
+        self.assertIn("8-128 characters", out)
+        self.assertIn("didn't match", out)
+        self.assertTrue(ctl._gui_module().verify_password(
+            "adminpass123", self.host.read(inst.GUI_PASSWORD).decode()))
+        self.assertNotIn("adminpass123", out)
+        self.assertIn("http://zerofi.local:8480", out)
+
+    def test_interactive_made_up_admin_password_is_shown_once(self):
+        rc, out = self.run_cli([], answers=["", "2", "", "2", "", "y", "n", "y", "2", "y"])
+        self.assertEqual(rc, 0, out)
+        shown = re.search(r"admin page password is: (\S+)", out).group(1)
+        self.assertEqual(out.count(shown), 1)
+        self.assertTrue(ctl._gui_module().verify_password(
+            shown, self.host.read(inst.GUI_PASSWORD).decode()))
+
+    def test_interactive_can_decline_the_page(self):
+        rc, out = self.run_cli([], answers=["", "2", "", "2", "", "y", "n", "n", "y"])
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(self.host.exists(inst.GUI_SERVICE))
+
+    def test_interactive_offers_to_keep_an_existing_admin_password(self):
+        self.run_cli(["--yes", "--generate-password", "--generate-admin-password"])
+        before = self.host.read(inst.GUI_PASSWORD)
+        self.said.clear()
+        rc, out = self.run_cli([], answers=["1", "y", "n", "y", "3", "y"])
+        self.assertEqual(rc, 0, out)
+        self.assertIn("Keep the existing one in /etc/ghostap/gui-password", out)
+        self.assertEqual(self.host.read(inst.GUI_PASSWORD), before)
 
 
 class PreflightLinkTests(unittest.TestCase):

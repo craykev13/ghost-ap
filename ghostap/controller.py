@@ -980,6 +980,62 @@ def current_connection(sh: Shell, iface: str) -> str | None:
     return name if name and name != "--" else None
 
 
+PING_COUNT = 2
+PING_WAIT = 1            # seconds to wait for each reply
+LINK_CACHE_SECONDS = 15  # the admin page polls; don't ping the phone every 3 s
+
+
+def default_gateway(sh: Shell, iface: str) -> str | None:
+    """The address of the router (here, the phone) this interface sends traffic to."""
+    rc, out = sh.probe("ip", "-4", "route", "show", "default", "dev", iface)
+    if rc != 0:
+        return None
+    for line in out.splitlines():
+        m = re.match(r"default via (\d+\.\d+\.\d+\.\d+)\b", line.strip())
+        if m:
+            return m.group(1)
+    return None
+
+
+def link_health(sh: Shell, iface: str) -> dict:
+    """Is the network we joined actually answering? NetworkManager says "connected"
+    once it has an address; this asks the router. Only the router is pinged, never
+    the internet (this project works offline).
+
+    reachable: True (answered), False (no answer), None (couldn't check: no ping
+    program, or it isn't allowed to run here)."""
+    gw = default_gateway(sh, iface)
+    if gw is None:
+        return {"gateway": None, "reachable": False}
+    rc, _ = sh.probe("ping", "-n", "-c", str(PING_COUNT), "-W", str(PING_WAIT),
+                     "-I", iface, gw)
+    # iputils ping: 0 = got a reply, 1 = no reply, anything else = it couldn't run.
+    return {"gateway": gw, "reachable": True if rc == 0 else False if rc == 1 else None}
+
+
+_link_cache: dict = {}
+
+
+def cached_link_health(sh: Shell, iface: str) -> dict:
+    now = sh.monotonic()
+    hit = _link_cache.get(iface)
+    if hit and now - hit[0] < LINK_CACHE_SECONDS:
+        return hit[1]
+    value = link_health(sh, iface)
+    _link_cache[iface] = (now, value)
+    return value
+
+
+def _describe_link(link: dict) -> str:
+    if link["gateway"] is None:
+        return "joined, but no router address (gateway) was handed out"
+    if link["reachable"] is None:
+        return f"router {link['gateway']} (could not check whether it answers)"
+    if link["reachable"]:
+        return f"router {link['gateway']} is answering"
+    return f"router {link['gateway']} is NOT answering"
+
+
 NUDGE_EVERY = 10      # seconds between "look for the network and join it" attempts
 SCAN_SETTLE = 4       # a rescan on the Pi Zero W takes a few seconds
 
@@ -1492,6 +1548,10 @@ def cmd_start(cfg: Config, sh: Shell) -> int:
         return 0
     if wait_for_wifi(sh, cfg):
         log.info("connected to WiFi; AP not needed")
+        if not sh.dry_run:
+            link = link_health(sh, cfg.interface)
+            (log.info if link["reachable"] is not False else log.warning)(
+                "link check: %s", _describe_link(link))
         return 0
     _begin_ap(sh, cfg, purpose="boot", rescue_seconds=cfg.rescue_timeout,
               require_rescue=False)
@@ -1557,7 +1617,7 @@ def _seconds_left(state: dict | None, sh: Shell) -> int | None:
     return None if deadline is None else max(0, int(deadline - sh.wallclock()))
 
 
-def collect_status(cfg: Config, sh: Shell) -> dict:
+def collect_status(cfg: Config, sh: Shell, link=link_health) -> dict:
     """What `status` shows, as data (the admin page reads this too)."""
     state = read_state()
     if _ap_running(sh):
@@ -1576,13 +1636,14 @@ def collect_status(cfg: Config, sh: Shell) -> dict:
         fo = sh.run("systemctl", "is-active", f"{FAILOVER_UNIT}.timer", check=False)
         failover["countdown_running"] = fo.stdout.strip() == "active"
     return {"mode": mode, "ssid": cfg.ssid, "gateway": str(cfg.address.ip),
+            "link": link(sh, cfg.interface) if mode == "client" and not sh.dry_run else None,
             "live_test": live_test, "rescue_armed": armed.stdout.strip() == "active",
             "failover": failover}
 
 
 def collect_gui_status(cfg: Config, sh: Shell) -> dict:
     """collect_status plus the extra facts the admin page shows."""
-    info = collect_status(cfg, sh)
+    info = collect_status(cfg, sh, link=cached_link_health)
     addrs = []
     r = sh.run("ip", "-4", "-o", "addr", "show", "dev", cfg.interface, check=False)
     for line in r.stdout.splitlines():
@@ -1606,6 +1667,8 @@ def cmd_status(cfg: Config, sh: Shell) -> int:
         print(f"mode: AP  (SSID '{cfg.ssid}', gateway {cfg.address.ip})")
     elif st["mode"] == "client":
         print("mode: client (connected to WiFi)")
+        if st.get("link"):
+            print("link: " + _describe_link(st["link"]))
     else:
         print("mode: disconnected (no AP, no WiFi)")
     if st["live_test"] is not None:

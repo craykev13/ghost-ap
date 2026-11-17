@@ -116,6 +116,15 @@ function render(s) {
   if (s.mode === "ap") {
     conn.push(el("p", "muted", "Join it, then use " + s.gateway + " to reach the Pi."));
   }
+  if (s.mode === "client" && s.link) {
+    const L = s.link;
+    let text, cls = "muted";
+    if (L.gateway === null) { text = "Joined, but the network gave no router address."; cls = "muted warn-text"; }
+    else if (L.reachable === true) text = "Router " + L.gateway + " is answering.";
+    else if (L.reachable === false) { text = "Router " + L.gateway + " is not answering."; cls = "muted warn-text"; }
+    else text = "Router " + L.gateway + " (couldn't check if it answers).";
+    conn.push(el("p", cls, text));
+  }
   cards.appendChild(card("Connection", ...conn));
 
   cards.appendChild(card("This page",

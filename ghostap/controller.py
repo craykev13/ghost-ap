@@ -963,6 +963,16 @@ def wifi_connected(sh: Shell, iface: str) -> bool:
     return any(line.startswith(prefix) for line in r.stdout.splitlines())
 
 
+def friendly_connection(name: str | None, iface: str) -> str | None:
+    """The name to show a person. Netplan-made profiles are called
+    'netplan-wlan0-MyNetwork'; the network is just 'MyNetwork'. Display only:
+    the real name is still what we hand to nmcli."""
+    prefix = f"netplan-{iface}-"
+    if name and name.startswith(prefix) and len(name) > len(prefix):
+        return name[len(prefix):]
+    return name
+
+
 def current_connection(sh: Shell, iface: str) -> str | None:
     """Name of the WiFi profile the interface is on right now (so we can go back to it)."""
     r = sh.run("nmcli", "-g", "GENERAL.CONNECTION", "device", "show", iface, check=False)
@@ -1581,8 +1591,8 @@ def collect_gui_status(cfg: Config, sh: Shell) -> dict:
             addrs.append(m.group(1))
     info.update({"hostname": socket.gethostname(), "interface": cfg.interface,
                  "addresses": addrs,
-                 "wifi": current_connection(sh, cfg.interface) if info["mode"] == "client"
-                 else None, "gui_port": cfg.gui_port, "live_timeout": cfg.live_timeout})
+                 "wifi": friendly_connection(current_connection(sh, cfg.interface), cfg.interface)
+                 if info["mode"] == "client" else None, "gui_port": cfg.gui_port, "live_timeout": cfg.live_timeout})
     helper = sh.run("systemctl", "is-active", APPLY_PATH_UNIT, check=False)
     applier = Applier()
     info["apply"] = {"available": helper.stdout.strip() == "active",

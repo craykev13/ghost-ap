@@ -180,6 +180,11 @@ class FakeSystem(ctl.Shell):
     def environment_problems(self, cfg):
         return []
 
+    def probe(self, *cmd):
+        """Silent read-only looks (route table, ping) must never reach the real machine."""
+        self.probes = getattr(self, "probes", []) + [cmd]
+        return 1, ""
+
     def capture(self, *cmd):
         """Diagnostic dumps are read-only: they must never count as an effect."""
         self.captures.append(cmd)
@@ -423,6 +428,29 @@ class BootFlowTests(Base):
         self.assertFalse(s.procs)
         self.assertIsNone(ctl.read_state())
         self.assertFalse([c for c in s.log if c[0] == "systemd-run"])
+
+    def _boot_logs(self, probe_answer):
+        s = FakeSystem(connect_after=10)
+        s.probe = lambda *cmd: probe_answer(cmd)
+        logging.disable(logging.NOTSET)
+        self.addCleanup(logging.disable, logging.CRITICAL)
+        with self.assertLogs(ctl.log, level="INFO") as cm:
+            ctl.cmd_start(self.cfg, s)
+        return [r for r in cm.records if r.getMessage().startswith("link check")]
+
+    def test_a_healthy_link_is_noted_in_the_boot_log(self):
+        recs = self._boot_logs(lambda cmd: (0, "default via 10.0.0.1 dev wlan0") if cmd[0] == "ip" else (0, ""))
+        self.assertEqual([r.levelname for r in recs], ["INFO"])
+        self.assertIn("is answering", recs[0].getMessage())
+
+    def test_a_dead_router_is_a_warning_in_the_boot_log(self):
+        recs = self._boot_logs(lambda cmd: (0, "default via 10.0.0.1 dev wlan0") if cmd[0] == "ip" else (1, ""))
+        self.assertEqual([r.levelname for r in recs], ["WARNING"])
+        self.assertIn("NOT answering", recs[0].getMessage())
+
+    def test_a_link_check_that_cannot_run_is_not_a_warning(self):
+        recs = self._boot_logs(lambda cmd: (0, "default via 10.0.0.1 dev wlan0") if cmd[0] == "ip" else (2, ""))
+        self.assertEqual([r.levelname for r in recs], ["INFO"])
 
     def test_no_wifi_starts_verified_ap_and_disarms_timer(self):
         s = FakeSystem()

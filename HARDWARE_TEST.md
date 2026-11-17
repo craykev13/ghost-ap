@@ -115,5 +115,11 @@ rejoin the hotspot on its own. If it doesn't: `sudo ghostap recover`.
 send `journalctl -u ghostap-gui -n 20 --no-pager`: the page reads the journal from inside its sandbox,
 which is the one thing not checked off-Pi.
 
+**F7. Link check.** On the Status tab, while joined to the hotspot, the Connection card should say
+"Router 172.20.10.1 is answering." (your hotspot's address). `sudo ghostap status` prints a `link:` line
+too, and after a reboot `Recent activity` has a `link check:` line. If the card says "couldn't check if it
+answers", the page's sandbox isn't allowed to run `ping`: tell me and I'll sort it out. Turn the phone's
+hotspot off and on again to see it change (it can lag by about 15 seconds).
+
 ## Not covered yet
 A logs page, and a link-health check after the AP-to-client switch.

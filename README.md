@@ -67,6 +67,9 @@ sudo cp ~/ghost-ap/systemd/ghostap-gui.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now ghostap-gui
 ```
 
+After a `git pull`, restart the page so it runs the new code (`sudo systemctl restart ghostap-gui`);
+the page shows a banner if it notices it's out of date.
+
 Open `http://<hostname>.local:8480` (for example `http://zerofi.local:8480`) or the Pi's
 IP address with `:8480`. When the Pi is running its own network, that's `http://192.168.4.1:8480`.
 The port and listen address are settings under `[gui]`. Sign-in is rate-limited, the page runs

@@ -163,6 +163,7 @@ async function refresh() {
     failures = 0;
     $("banner").hidden = true;
     lastStatus = r.data;
+    $("stale").hidden = !r.data.code_changed;
     render(r.data);
     renderApply();
   } catch (e) {

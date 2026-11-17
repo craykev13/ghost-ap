@@ -2289,6 +2289,31 @@ class AdminPageControllerTests(Base):
         info = seen["provider"]()
         self.assertEqual(info["mode"], "disconnected")
         self.assertNotIn("testpass123", json.dumps(info))
+        self.assertIs(info["code_changed"], False)
+        # `git pull` replaced the program while the page kept running the old one
+        with mock.patch.object(ctl, "_code_fingerprint", return_value=("new",)):
+            self.assertIs(seen["provider"]()["code_changed"], True)
+
+    def test_the_code_fingerprint_changes_when_a_program_file_is_replaced(self):
+        before = ctl._code_fingerprint()
+        self.assertEqual(before, ctl._code_fingerprint())
+        self.assertEqual(len(before), 2)
+        self.assertNotIn(None, before)
+        real = pathlib.Path.stat
+
+        def newer(self_path, *a, **k):
+            st = real(self_path, *a, **k)
+            if self_path.name == "gui.py":
+                return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid,
+                                       st.st_gid, st.st_size + 1, st.st_atime, st.st_mtime,
+                                       st.st_ctime))
+            return st
+        with mock.patch.object(pathlib.Path, "stat", newer):
+            self.assertNotEqual(ctl._code_fingerprint(), before)
+
+    def test_a_missing_program_file_does_not_crash_the_status(self):
+        with mock.patch.object(pathlib.Path, "stat", side_effect=OSError):
+            self.assertEqual(ctl._code_fingerprint(), (None, None))
 
     def test_gui_command_refuses_when_off_or_without_a_password(self):
         gui, cfg = self.gui_env(enabled=False)

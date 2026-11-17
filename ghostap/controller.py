@@ -1632,6 +1632,20 @@ def _gui_module():
     return mod
 
 
+def _code_fingerprint() -> tuple:
+    """Size and time of the program files the page runs from. If `git pull` replaces them
+    while the page is running, the page is still the OLD program until it's restarted."""
+    here = Path(__file__).resolve().parent
+    out = []
+    for name in ("controller.py", "gui.py"):
+        try:
+            st = (here / name).stat()
+            out.append((st.st_mtime_ns, st.st_size))
+        except OSError:
+            out.append(None)
+    return tuple(out)
+
+
 def cmd_gui(cfg: Config, sh: Shell) -> int:
     if not cfg.gui_enabled:
         log.error("the admin page is off. Turn it on with `enabled = true` under [gui] "
@@ -1646,7 +1660,10 @@ def cmd_gui(cfg: Config, sh: Shell) -> int:
         return 1
     quiet = Shell(quiet=True)
     try:
-        server = gui.make_server(lambda: collect_gui_status(cfg, quiet), stored,
+        started_as = _code_fingerprint()
+        server = gui.make_server(lambda: {**collect_gui_status(cfg, quiet),
+                                          "code_changed": _code_fingerprint() != started_as},
+                                 stored,
                                  cfg.gui_bind, cfg.gui_port,
                                  settings=SettingsStore(cfg.path), applier=Applier(),
                                  logs=LogReader())

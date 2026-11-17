@@ -258,6 +258,13 @@ class PageTests(unittest.TestCase):
         self.assertNotIn("soon", html)
         self.assertIn('id="logs-view"', html)
 
+    def test_the_page_warns_when_it_is_running_old_code(self):
+        html = (ROOT / "ghostap" / "web" / "index.html").read_text()
+        js = (ROOT / "ghostap" / "web" / "app.js").read_text()
+        self.assertIn('id="stale"', html)
+        self.assertIn("systemctl restart ghostap-gui", html)
+        self.assertIn("code_changed", js)
+
     def test_log_text_is_set_as_text(self):
         js = (ROOT / "ghostap" / "web" / "app.js").read_text()
         self.assertIn('el("div", "logline "', js)

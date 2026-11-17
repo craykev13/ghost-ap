@@ -2303,6 +2303,17 @@ class AdminPageControllerTests(Base):
             self.assertEqual(ctl.main(["gui-password"]), 1)
         self.assertFalse(target.exists())
 
+    def test_looking_commands_do_not_write_into_the_controller_log(self):
+        path = self.write_config()
+        # (command, is the file log skipped?). _setup_file_log's one argument means "skip it".
+        for command, skipped in (("status", True), ("preflight", True), ("gui", True),
+                                 ("stop", False)):
+            with mock.patch.object(ctl, "_setup_file_log") as setup, \
+                    mock.patch.dict(ctl.COMMANDS, {command: mock.Mock(return_value=0)}), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(ctl.main([command, "-c", str(path)]), 0, command)
+            setup.assert_called_once_with(skipped)
+
     def test_the_gui_never_needs_the_ap_password_to_start(self):
         # the service user can't read /etc/ghostap/passphrase, and shouldn't need to
         path = self.write_config('[gui]\nenabled = true\n')

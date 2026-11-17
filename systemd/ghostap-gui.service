@@ -1,0 +1,24 @@
+[Unit]
+Description=GhostAP admin page
+After=network.target
+
+[Service]
+# Runs as a throwaway unprivileged user. It can look at the system but not change it.
+DynamicUser=yes
+# The password hash is handed to the service privately by systemd; the service user
+# itself can't read /etc/ghostap/gui-password.
+LoadCredential=gui-password:/etc/ghostap/gui-password
+ExecStart=/usr/bin/python3 /usr/local/bin/ghostap gui
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+ReadOnlyPaths=/etc/ghostap -/run/ghostap
+
+[Install]
+WantedBy=multi-user.target

@@ -90,5 +90,25 @@ sudo journalctl -b -1 --no-pager | grep -iE 'ghostap|hostapd|dnsmasq|Killing pro
 ```
 (`-b -1` is the previous boot, so it needs the persistent journal.)
 
+## F. Admin page: Settings and "Try the saved settings"
+Needs the page installed (`sudo python3 install.py`, say yes to the admin page).
+
+**F1. Helper is in place.** `systemctl is-active ghostap-apply.path` says `active`, and
+`ls -ld /run/ghostap-gui` shows the page's folder. The Settings tab's "Try" card must not say the
+helper is missing.
+
+**F2. Save a harmless change** (for example `boot_timeout`). `sudo grep boot_timeout /etc/ghostap/ghostap.toml`
+shows it, your comments are still there, and `ghostap.toml.bak` holds the old file.
+
+**F3. Try it (do this with the Pi next to you).** On the hotspot, Settings, "Try the saved
+settings", confirm. The page stops responding. Join ZeroFi on the phone, open
+`http://192.168.4.1:8480`, sign in, tap **Keep this**. `sudo ghostap status` should show `mode: AP`.
+Revert with `sudo ghostap stop` (or reboot with the hotspot ON).
+
+**F4. Walk away.** Repeat F3 but do nothing. After about `live_timeout` plus 30 s the Pi should
+rejoin the hotspot on its own. If it doesn't: `sudo ghostap recover`.
+
+**F5. If "Try" does nothing:** `journalctl -u ghostap-apply.service -n 40 --no-pager`.
+
 ## Not covered yet
-The web GUI, and a link-health check after the AP-to-client switch.
+A logs page, and a link-health check after the AP-to-client switch.

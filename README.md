@@ -44,7 +44,13 @@ can edit the config (network name, channel, addresses, timers and so on) without
 no internet and loads nothing from outside. Saving writes the config file (your comments stay,
 and the previous copy is kept as `ghostap.toml.bak`) but doesn't change the live network:
 changes apply at the next boot fallback, or try them safely now with `sudo ghostap test`.
-The admin password, and the admin page's own port and address, are still changed over SSH. The installer offers it: say yes, pick (or generate) an admin password, and it
+The admin password, and the admin page's own port and address, are still changed over SSH.
+
+Under the form, **Try the saved settings** runs the same self-reverting test as
+`sudo ghostap test`: the Pi raises its own network with your settings, and unless you join it,
+open the page there and tap **Keep**, it undoes itself. The page itself has no network powers.
+It leaves a small request file, and a separate root-owned helper (`ghostap-apply`, installed
+by `install.py`) carries out one of exactly three things: try, keep or revert. The installer offers it: say yes, pick (or generate) an admin password, and it
 installs and enables the page, then prints the address when it finishes. Unattended, use
 `--admin-password-file FILE` or `--generate-admin-password`, and `--no-admin-page` to skip it.
 `ghostap status` shows the address too.
@@ -79,5 +85,4 @@ yet; `ghostap preflight` says so instead of guessing.
 
 ## Status
 
-Works and is tested (an automated test suite, plus real-hardware runs). Planned: applying changes from the
-admin page, a logs page, link-health checks after the AP-to-client switch, other network setups.
+Works and is tested (an automated test suite, plus real-hardware runs). Planned: a logs page, link-health checks after the AP-to-client switch, other network setups.

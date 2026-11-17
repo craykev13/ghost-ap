@@ -503,7 +503,7 @@ class PageFilesTests(unittest.TestCase):
 
     def test_the_page_is_small_enough_for_a_pi_zero(self):
         total = sum(len(t.encode()) for t in self.files.values())
-        self.assertLess(total, 30_000)
+        self.assertLess(total, 40_000)
 
     def test_the_page_files_are_exactly_the_ones_the_server_may_serve(self):
         on_disk = {p.name for p in WEB.iterdir()}

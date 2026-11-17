@@ -2203,6 +2203,27 @@ class AdminPageControllerTests(Base):
         sh, _ = self.status()
         self.assertIsNone(ctl.collect_gui_status(self.cfg, sh)["wifi"])
 
+    def test_the_page_status_says_whether_the_apply_helper_is_there(self):
+        for active, expected in (("active\n", True), ("inactive\n", False), ("", False)):
+            sh, _ = self.status(extra={("systemctl", "is-active", "ghostap-apply.path"): active})
+            st = ctl.collect_gui_status(self.cfg, sh)
+            self.assertIs(st["apply"]["available"], expected, active)
+
+    def test_the_page_status_carries_a_pending_request_and_the_last_result(self):
+        d = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        (d / "request").write_text("{}")
+        (d / "result").write_text(json.dumps({"action": "test", "ok": False,
+                                              "message": "nope", "at": 5, "extra": "x"}))
+        sh, _ = self.status()
+        with mock.patch.object(ctl, "APPLY_REQUEST", d / "request"), \
+                mock.patch.object(ctl, "APPLY_RESULT", d / "result"):
+            st = ctl.collect_gui_status(self.cfg, sh)
+        self.assertTrue(st["apply"]["pending"])
+        self.assertEqual(st["apply"]["last"],
+                         {"action": "test", "ok": False, "message": "nope", "at": 5})
+        json.dumps(st)
+
     def test_the_page_status_never_contains_the_password(self):
         sh, _ = self.status(connected=True)
         self.assertNotIn(self.cfg.passphrase, json.dumps(ctl.collect_gui_status(self.cfg, sh)))
@@ -2252,9 +2273,9 @@ class AdminPageControllerTests(Base):
             def server_close(self):
                 seen["closed"] = True
 
-        def fake_make(provider, stored, host, port, settings=None):
+        def fake_make(provider, stored, host, port, settings=None, applier=None):
             seen.update(provider=provider, stored=stored, host=host, port=port,
-                        settings=settings)
+                        settings=settings, applier=applier)
             return FakeServer()
         with mock.patch.object(gui, "make_server", fake_make):
             self.assertEqual(ctl.cmd_gui(cfg, StubShell()), 0)
@@ -2263,6 +2284,7 @@ class AdminPageControllerTests(Base):
         self.assertTrue(seen["closed"])
         self.assertIsInstance(seen["settings"], ctl.SettingsStore)
         self.assertEqual(seen["settings"].path, cfg.path)
+        self.assertIsInstance(seen["applier"], ctl.Applier)
         info = seen["provider"]()
         self.assertEqual(info["mode"], "disconnected")
         self.assertNotIn("testpass123", json.dumps(info))

@@ -22,6 +22,8 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 ReadOnlyPaths=-/run/ghostap
 # The Settings page edits the config file (and keeps one .bak copy beside it).
 ReadWritePaths=/etc/ghostap
+# Its own folder for leaving requests for ghostap-apply.path (nothing else is writable).
+RuntimeDirectory=ghostap-gui
 
 [Install]
 WantedBy=multi-user.target

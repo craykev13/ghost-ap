@@ -1582,7 +1582,11 @@ def collect_gui_status(cfg: Config, sh: Shell) -> dict:
     info.update({"hostname": socket.gethostname(), "interface": cfg.interface,
                  "addresses": addrs,
                  "wifi": current_connection(sh, cfg.interface) if info["mode"] == "client"
-                 else None, "gui_port": cfg.gui_port})
+                 else None, "gui_port": cfg.gui_port, "live_timeout": cfg.live_timeout})
+    helper = sh.run("systemctl", "is-active", APPLY_PATH_UNIT, check=False)
+    applier = Applier()
+    info["apply"] = {"available": helper.stdout.strip() == "active",
+                     "pending": applier.pending(), "last": applier.last()}
     return info
 
 
@@ -1644,7 +1648,7 @@ def cmd_gui(cfg: Config, sh: Shell) -> int:
     try:
         server = gui.make_server(lambda: collect_gui_status(cfg, quiet), stored,
                                  cfg.gui_bind, cfg.gui_port,
-                                 settings=SettingsStore(cfg.path))
+                                 settings=SettingsStore(cfg.path), applier=Applier())
     except OSError as e:
         raise GhostAPError(f"can't listen on {cfg.gui_bind}:{cfg.gui_port}: {e}")
     log.info("admin page on http://%s:%s", cfg.gui_bind, cfg.gui_port)
@@ -1749,6 +1753,107 @@ def cmd_test_abort(cfg: Config, sh: Shell) -> int:
     if state is None or state.get("purpose") != "test":
         raise GhostAPError("no live test is active. (To stop a normal AP: ghostap stop)")
     return _report_restore(_unwind(sh, cfg, wait=True), "live test aborted", cfg)
+
+
+# --------------------------------------------------------------------------
+# Applying changes from the admin page.
+#
+# The page runs sandboxed and can't touch the network, on purpose. So it can't run
+# `ghostap test` itself. Instead it drops a tiny request file; systemd (watching for
+# that file) starts `ghostap apply-request` as root, which does ONE of three fixed
+# things and writes down how it went. The page can ask for nothing else.
+# --------------------------------------------------------------------------
+
+APPLY_DIR = Path("/run/ghostap-gui")                  # the page's own writable folder
+APPLY_REQUEST = APPLY_DIR / "request"
+APPLY_RESULT = RUN_DIR / "apply-result"
+APPLY_PATH_UNIT = "ghostap-apply.path"
+APPLY_ACTIONS = ("test", "commit", "abort")
+
+
+class ApplyRejected(GhostAPError):
+    """A request from the page was turned away (and nothing was started)."""
+
+
+class Applier:
+    """The page's side: asks for an action and reads how the last one went."""
+    Rejected = ApplyRejected
+
+    def __init__(self, request: Path | None = None, result: Path | None = None):
+        self.request_file = Path(request or APPLY_REQUEST)
+        self.result_file = Path(result or APPLY_RESULT)
+        self._lock = threading.Lock()
+
+    def pending(self) -> bool:
+        return self.request_file.exists()
+
+    def last(self) -> dict | None:
+        try:
+            data = json.loads(self.result_file.read_text())
+        except (OSError, ValueError):
+            return None
+        if not isinstance(data, dict) or not isinstance(data.get("message"), str):
+            return None
+        return {k: data.get(k) for k in ("action", "ok", "message", "at")}
+
+    def request(self, action) -> None:
+        if action not in APPLY_ACTIONS:
+            raise ApplyRejected("unknown action")
+        with self._lock:
+            if self.pending():
+                raise ApplyRejected("Still working on the last request. Give it a moment.")
+            tmp = self.request_file.with_name(self.request_file.name + ".new")
+            try:
+                tmp.write_text(json.dumps({"action": action}))
+                os.replace(tmp, self.request_file)
+            except OSError as e:
+                with contextlib.suppress(OSError):
+                    tmp.unlink()
+                raise ApplyRejected(f"couldn't send the request: {e}")
+
+
+def _apply_message(action: str, cfg: Config) -> str:
+    if action == "test":
+        return (f"Trying the saved settings. Join '{cfg.ssid}', open "
+                f"http://{cfg.address.ip}:{cfg.gui_port} and tap Keep within "
+                f"{cfg.live_timeout} seconds, or it reverts by itself.")
+    return "Kept. The test network stays up." if action == "commit" else "Reverted."
+
+
+def _write_apply_result(action, ok: bool, message: str) -> None:
+    RUN_DIR.mkdir(mode=0o755, parents=True, exist_ok=True)
+    _write_private(APPLY_RESULT, json.dumps(
+        {"action": action, "ok": ok, "message": message, "at": int(time.time())}))
+    os.chmod(APPLY_RESULT, 0o644)
+
+
+def cmd_apply_request(cfg: Config, sh: Shell) -> int:
+    """Run by systemd when the page leaves a request. Reads it, deletes it, does it."""
+    try:
+        raw = APPLY_REQUEST.read_text()
+    except FileNotFoundError:
+        return 0
+    except OSError as e:
+        raise GhostAPError(f"can't read the request: {e}")
+    APPLY_REQUEST.unlink(missing_ok=True)       # first, so a failure can't make it loop
+    try:
+        action = json.loads(raw).get("action")
+    except (ValueError, AttributeError):
+        action = None
+    if action not in APPLY_ACTIONS:
+        log.warning("ignoring a request that isn't one of %s", ", ".join(APPLY_ACTIONS))
+        _write_apply_result(None, False, "That request wasn't understood.")
+        return 0
+    fn = {"test": cmd_test_start, "commit": cmd_test_commit, "abort": cmd_test_abort}[action]
+    log.info("admin page asked for: %s", action)
+    try:
+        fn(cfg, sh)
+    except GhostAPError as e:
+        log.error("%s", e)
+        _write_apply_result(action, False, str(e))
+        return 0
+    _write_apply_result(action, True, _apply_message(action, cfg))
+    return 0
 
 
 # ---- preflight: "will this work on THIS machine?" ----------------------------------
@@ -1961,6 +2066,7 @@ COMMANDS = {"start": cmd_start, "stop": cmd_stop, "status": cmd_status,
             "recover": cmd_recover, "test": cmd_test_start,
             "failover": cmd_failover, "event": cmd_event,
             "snapshot": cmd_snapshot, "preflight": cmd_preflight, "gui": cmd_gui, "gui-password": None,
+            "apply-request": cmd_apply_request,
             "schema": None, "example-config": None}
 
 

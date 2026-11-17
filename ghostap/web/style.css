@@ -113,6 +113,11 @@ textarea { min-height: 84px; font: 13px ui-monospace, SFMono-Regular, Menlo, mon
 button.secondary { background: var(--card); color: var(--text); border: 1px solid var(--line); }
 button.secondary:disabled { opacity: .5; cursor: default; }
 
+.ok-text { color: var(--ok); }
+.bad-text { color: var(--bad); }
+.steps { margin: 0; padding-left: 20px; display: grid; gap: 6px; font-size: 14px; }
+.card .actions { position: static; border: 0; padding: 0; background: none; }
+
 /* folding sections and the save bar */
 details.fold { padding: 0; gap: 0; }
 details.fold > summary { cursor: pointer; padding: 16px 20px; list-style: none; font-size: 13px;

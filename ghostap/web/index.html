@@ -56,8 +56,8 @@
     </div>
     <form id="settings-view" class="settings" hidden novalidate>
       <p class="note">Changes are saved to the config file. They are <strong>not live yet</strong>:
-        they apply the next time the Pi starts its own network, or when you run
-        <code>sudo ghostap test</code>, which undoes itself if something goes wrong.</p>
+        they apply the next time the Pi starts its own network, or when you use
+        <strong>Try the saved settings</strong> below, which undoes itself if something goes wrong.</p>
       <div id="settings-body"></div>
       <label class="check"><input id="show-advanced" type="checkbox"> Show advanced settings</label>
       <p id="settings-msg" class="form-msg" role="status"></p>
@@ -65,6 +65,7 @@
         <button id="settings-save" class="primary" type="submit" disabled>Save changes</button>
         <button id="settings-undo" class="secondary" type="button" disabled>Undo edits</button>
       </div>
+      <div id="apply-card" class="card apply"></div>
     </form>
   </section>
 </div>

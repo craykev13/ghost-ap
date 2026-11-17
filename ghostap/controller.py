@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import importlib.util
 import ipaddress
 import json
@@ -33,8 +34,10 @@ import re
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 from dataclasses import dataclass, field
@@ -564,6 +567,223 @@ def render_example_config() -> str:
             out.append(("# " + line) if s.commented else line)
             out.append("")
     return "\n".join(out).rstrip() + "\n"
+
+
+# --------------------------------------------------------------------------
+# Changing settings in the config file (what the admin page's Settings form uses).
+# Edits only the lines that change, so the person's own comments and layout survive.
+# --------------------------------------------------------------------------
+
+_HEADER_RE = re.compile(r"^\s*\[([^\[\]]+)\]\s*(?:#.*)?$")
+_MULTILINE_STRING = ('"' * 3, "'" * 3)
+
+
+def _is_editable(s: Setting) -> bool:
+    """The password file path and the admin page's own settings stay a job for the
+    command line: a mistake there can lock you out of the page that's editing them."""
+    return s.kind != "secret_file" and s.section != "gui"
+
+
+def _value_end(lines: list[str], i: int) -> tuple[int, str]:
+    """Last line of the value that starts on lines[i] (arrays can span lines), plus any
+    trailing comment on that last line. Raises if it can't be sure (multi-line strings)."""
+    depth, quote, n = 0, "", i
+    text = lines[i].split("=", 1)[1]
+    if text.lstrip().startswith(_MULTILINE_STRING):
+        raise GhostAPError("a setting uses a multi-line string; edit the file by hand")
+    while True:
+        j, comment = 0, ""
+        while j < len(text):
+            ch = text[j]
+            if quote:
+                if quote == '"' and ch == "\\":
+                    j += 1
+                elif ch == quote:
+                    quote = ""
+            elif ch in ('"', "'"):
+                quote = ch
+            elif ch == "#":
+                gap = len(text[:j]) - len(text[:j].rstrip())    # keep the spacing before it
+                comment = text[j - gap:].rstrip("\n")
+                break
+            elif ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+            j += 1
+        if depth <= 0:
+            return n, comment
+        n += 1
+        if n >= len(lines):
+            raise GhostAPError("the config has an unfinished list; edit the file by hand")
+        text = lines[n]
+
+
+def apply_edits(text: str, edits: dict) -> str:
+    """edits maps (section, key) -> a value to write, or None to remove the line (the
+    setting goes back to its default). Returns the new file text."""
+    lines = text.splitlines(keepends=True)
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+    for (section, key), value in edits.items():
+        bounds = None
+        for i, line in enumerate(lines):
+            m = _HEADER_RE.match(line)
+            if m is None:
+                continue
+            if bounds is not None:
+                bounds = (bounds[0], i)
+                break
+            if m.group(1).strip() == section:
+                bounds = (i, len(lines))
+        key_re = re.compile(rf"^\s*{re.escape(key)}\s*=")
+        found = None
+        if bounds:
+            for i in range(bounds[0] + 1, bounds[1]):
+                if key_re.match(lines[i]):
+                    found = i
+                    break
+        if found is not None:
+            end, comment = _value_end(lines, found)
+            if value is None:
+                lines[found:end + 1] = []
+            else:
+                tail = comment if comment.startswith((" ", "\t")) else f"  {comment}" if comment else ""
+                lines[found:end + 1] = [f"{key} = {_toml_value(value)}{tail}\n"]
+            continue
+        if value is None:
+            continue                       # not in the file: already the default
+        new = f"{key} = {_toml_value(value)}\n"
+        if bounds is None:
+            if lines and lines[-1].strip():
+                lines.append("\n")
+            lines += [f"[{section}]\n", new]
+            continue
+        at = bounds[1]
+        while at > bounds[0] + 1 and not lines[at - 1].strip():
+            at -= 1                        # keep blank lines between sections
+        commented = re.compile(rf"^\s*#\s*{re.escape(key)}\s*=")
+        for i in range(bounds[0] + 1, bounds[1]):
+            if commented.match(lines[i]):
+                at = i + 1                 # right under the example line
+                break
+        lines.insert(at, new)
+    return "".join(lines)
+
+
+class SettingsRejected(GhostAPError):
+    """The change wasn't saved. `fields` maps a setting (section.key, or "" for the
+    form as a whole) to what's wrong; `conflict` means the file changed under you."""
+    def __init__(self, message: str, fields: dict | None = None, conflict: bool = False):
+        super().__init__(message)
+        self.fields = fields or {}
+        self.conflict = conflict
+
+
+def _default_of(section: str, key: str):
+    d = _BY_SECTION[section][key].default
+    return list(d) if isinstance(d, tuple) else d
+
+
+class SettingsStore:
+    Rejected = SettingsRejected
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self._lock = threading.Lock()
+
+    def _read(self) -> tuple[bytes, dict]:
+        try:
+            data = self.path.read_bytes()
+            raw = tomllib.loads(data.decode())
+        except (OSError, UnicodeDecodeError) as e:
+            raise GhostAPError(f"can't read {self.path}: {e}")
+        except tomllib.TOMLDecodeError as e:
+            raise GhostAPError(f"bad syntax in {self.path}: {e}")
+        return data, raw
+
+    def _values(self, raw: dict) -> dict:
+        out = {}
+        for s in SETTINGS:
+            body = raw.get(s.section)
+            body = body if isinstance(body, dict) else {}
+            out[f"{s.section}.{s.key}"] = body.get(s.key, _default_of(s.section, s.key))
+        return out
+
+    def get(self) -> dict:
+        data, raw = self._read()
+        schema = []
+        for item, s in zip(settings_schema(), SETTINGS):
+            item["editable"] = _is_editable(s)
+            item["nullable"] = s.kind == "bool" and s.default is None
+            schema.append(item)
+        return {"version": hashlib.sha256(data).hexdigest(), "schema": schema,
+                "values": self._values(raw)}
+
+    def save(self, changes: dict, version: str) -> dict:
+        with self._lock:
+            data, raw = self._read()
+            if hashlib.sha256(data).hexdigest() != version:
+                raise SettingsRejected(
+                    "The config file changed since this page loaded. Reload and try again.",
+                    conflict=True)
+            current = self._values(raw)
+            by_name = {f"{s.section}.{s.key}": s for s in SETTINGS}
+            edits, errors = {}, {}
+            for name, value in changes.items():
+                s = by_name.get(name)
+                if s is None or not _is_editable(s):
+                    errors[name] = "this setting can't be changed here"
+                elif value is None:
+                    if s.required:
+                        errors[name] = "this one is needed"
+                    elif s.key in (raw.get(s.section) or {}):
+                        edits[(s.section, s.key)] = None
+                else:
+                    try:
+                        coerced = _coerce(s, value)
+                    except (GhostAPError, ValueError) as e:
+                        errors[name] = str(e)
+                        continue
+                    if s.kind == "ipif":
+                        coerced = str(coerced)
+                    elif isinstance(coerced, tuple):
+                        coerced = list(coerced)
+                    if coerced == [] and s.kind == "list":
+                        if s.key in (raw.get(s.section) or {}):
+                            edits[(s.section, s.key)] = None     # none left: drop the line
+                    elif coerced != current[name]:
+                        edits[(s.section, s.key)] = coerced
+            if errors:
+                raise SettingsRejected("Some settings need fixing.", errors)
+            if not edits:
+                return {"saved": [], "version": version}
+            try:
+                new_text = apply_edits(data.decode(), edits)
+            except GhostAPError as e:
+                raise SettingsRejected(str(e))
+            tmp = self.path.with_name(f".{self.path.name}.new")
+            try:
+                tmp.write_text(new_text)
+                os.chmod(tmp, stat.S_IMODE(self.path.stat().st_mode))
+                try:
+                    load_config(tmp, secrets=False)
+                except GhostAPError as e:
+                    msg = str(e)
+                    word = re.match(r"\w+", msg)
+                    hit = [f"{a}.{b}" for a, b in edits if word and b == word.group()]
+                    raise SettingsRejected(msg, {hit[0]: msg} if hit else {"": msg})
+                shutil.copy2(self.path, self.path.with_name(self.path.name + ".bak"))
+                os.replace(tmp, self.path)
+            except OSError as e:
+                raise SettingsRejected(f"couldn't write {self.path}: {e}")
+            finally:
+                with contextlib.suppress(OSError):
+                    tmp.unlink()
+            log.info("admin page changed settings: %s",
+                     ", ".join(f"{a}.{b}" for a, b in edits))
+            return {"saved": [f"{a}.{b}" for a, b in edits],
+                    "version": hashlib.sha256(new_text.encode()).hexdigest()}
 
 
 # --------------------------------------------------------------------------
@@ -1423,7 +1643,8 @@ def cmd_gui(cfg: Config, sh: Shell) -> int:
     quiet = Shell(quiet=True)
     try:
         server = gui.make_server(lambda: collect_gui_status(cfg, quiet), stored,
-                                 cfg.gui_bind, cfg.gui_port)
+                                 cfg.gui_bind, cfg.gui_port,
+                                 settings=SettingsStore(cfg.path))
     except OSError as e:
         raise GhostAPError(f"can't listen on {cfg.gui_bind}:{cfg.gui_port}: {e}")
     log.info("admin page on http://%s:%s", cfg.gui_bind, cfg.gui_port)

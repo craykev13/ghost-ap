@@ -1648,7 +1648,8 @@ def cmd_gui(cfg: Config, sh: Shell) -> int:
     try:
         server = gui.make_server(lambda: collect_gui_status(cfg, quiet), stored,
                                  cfg.gui_bind, cfg.gui_port,
-                                 settings=SettingsStore(cfg.path), applier=Applier())
+                                 settings=SettingsStore(cfg.path), applier=Applier(),
+                                 logs=LogReader())
     except OSError as e:
         raise GhostAPError(f"can't listen on {cfg.gui_bind}:{cfg.gui_port}: {e}")
     log.info("admin page on http://%s:%s", cfg.gui_bind, cfg.gui_port)
@@ -1854,6 +1855,101 @@ def cmd_apply_request(cfg: Config, sh: Shell) -> int:
         return 0
     _write_apply_result(action, True, _apply_message(action, cfg))
     return 0
+
+
+# --------------------------------------------------------------------------
+# Logs for the admin page. Read-only, fixed sources, and a fixed set of commands: the page
+# can pick WHICH source and HOW MANY lines, never what is run.
+# --------------------------------------------------------------------------
+
+LOG_UNITS = ("ghostap.service", "ghostap-gui.service", "ghostap-apply.service",
+             f"{RESCUE_UNIT}.service", f"{FAILOVER_UNIT}.service")
+LOG_DEFAULT_LINES, LOG_MAX_LINES, LOG_MAX_LINE_CHARS = 200, 1000, 400
+_TAIL_BYTES = 512 * 1024
+_SECRET_RE = re.compile(r"(?i)\b(wpa_passphrase|passphrase|psk|password)(\s*[=:]\s*)\S+")
+
+
+def redact(line: str) -> str:
+    """Logs may be pasted into a chat, so keep anything password-shaped out of them."""
+    return _SECRET_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}********", line)
+
+
+def _journal_argv(lines: int, *, previous_boot: bool = False) -> list[str]:
+    argv = ["journalctl", "--no-pager", "-o", "short-iso", "-n", str(lines)]
+    if previous_boot:
+        argv += ["-b", "-1"]
+    for unit in LOG_UNITS:
+        argv += ["-u", unit]
+    # "+" means OR: our own units, or the daemons we start (they log under their own names)
+    argv += ["+", "-t", "hostapd", "+", "-t", "dnsmasq", "+", "-t", "ghostap"]
+    return argv
+
+
+class LogReader:
+    """Which logs the page can show. `runner(argv)` returns (exit code, text); tests swap it."""
+    SOURCES = {
+        "activity": "Recent activity",
+        "previous_boot": "Last boot",
+        "test": "Last live test",
+        "snapshots": "Radio snapshots",
+    }
+
+    def __init__(self, runner=None, test_log: Path | None = None,
+                 snapshot_log: Path | None = None):
+        self.runner = runner or self._run
+        self.test_log = Path(test_log or LOG_FILE)
+        self.snapshot_log = Path(snapshot_log or SNAPSHOT_FILE)
+
+    @staticmethod
+    def _run(argv: list[str]) -> tuple[int, str]:
+        try:
+            p = subprocess.run(argv, capture_output=True, text=True, timeout=15,
+                               errors="replace")
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return 1, str(e)
+        return p.returncode, p.stdout if p.returncode == 0 else (p.stderr or p.stdout)
+
+    @staticmethod
+    def _tail_file(path: Path) -> str:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - _TAIL_BYTES))
+            return f.read().decode("utf-8", "replace")
+
+    def sources(self) -> list[dict]:
+        return [{"id": k, "title": v} for k, v in self.SOURCES.items()]
+
+    def read(self, source, lines=LOG_DEFAULT_LINES) -> dict:
+        if source not in self.SOURCES:
+            raise ValueError("unknown log")
+        if isinstance(lines, bool) or not isinstance(lines, int):
+            raise ValueError("lines must be a number")
+        lines = max(10, min(LOG_MAX_LINES, lines))
+        note = ""
+        if source in ("activity", "previous_boot"):
+            rc, text = self.runner(_journal_argv(lines, previous_boot=source == "previous_boot"))
+            if rc != 0:
+                return {"source": source, "lines": [],
+                        "note": "Couldn't read the system log: " + redact(text.strip())[:200]}
+        else:
+            path = self.test_log if source == "test" else self.snapshot_log
+            try:
+                text = self._tail_file(path)
+            except FileNotFoundError:
+                what = ("No live test has run since the Pi last started."
+                        if source == "test" else
+                        "No snapshots yet. They're taken whenever the Pi starts its own network.")
+                return {"source": source, "lines": [], "note": what}
+            except OSError as e:
+                return {"source": source, "lines": [], "note": f"Couldn't read it: {e.strerror}"}
+        out = [redact(ln)[:LOG_MAX_LINE_CHARS] for ln in text.splitlines()
+               if not ln.startswith("-- ")]
+        if len(out) > lines:
+            out = out[-lines:]
+        if not out and not note:
+            note = "Nothing logged yet."
+        return {"source": source, "lines": out, "note": note}
 
 
 # ---- preflight: "will this work on THIS machine?" ----------------------------------

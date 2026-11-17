@@ -41,7 +41,8 @@ Unattended: `sudo python3 install.py --yes --generate-password --ssid MyPi --cou
 ## Admin page (preview)
 
 A small web page, served by the Pi itself, that shows what it's doing: connected or running
-its own network, addresses, the safety timer and failover, and a **Settings** tab where you
+its own network, addresses, the safety timer and failover, and a **Logs** tab (recent activity, the last boot, the last live test, radio snapshots; passwords are
+hidden, and Copy puts the lines on your clipboard to paste), and a **Settings** tab where you
 can edit the config (network name, channel, addresses, timers and so on) without SSH. It uses
 no internet and loads nothing from outside. Saving writes the config file (your comments stay,
 and the previous copy is kept as `ghostap.toml.bak`) but doesn't change the live network:

@@ -2273,9 +2273,9 @@ class AdminPageControllerTests(Base):
             def server_close(self):
                 seen["closed"] = True
 
-        def fake_make(provider, stored, host, port, settings=None, applier=None):
+        def fake_make(provider, stored, host, port, settings=None, applier=None, logs=None):
             seen.update(provider=provider, stored=stored, host=host, port=port,
-                        settings=settings, applier=applier)
+                        settings=settings, applier=applier, logs=logs)
             return FakeServer()
         with mock.patch.object(gui, "make_server", fake_make):
             self.assertEqual(ctl.cmd_gui(cfg, StubShell()), 0)
@@ -2285,6 +2285,7 @@ class AdminPageControllerTests(Base):
         self.assertIsInstance(seen["settings"], ctl.SettingsStore)
         self.assertEqual(seen["settings"].path, cfg.path)
         self.assertIsInstance(seen["applier"], ctl.Applier)
+        self.assertIsInstance(seen["logs"], ctl.LogReader)
         info = seen["provider"]()
         self.assertEqual(info["mode"], "disconnected")
         self.assertNotIn("testpass123", json.dumps(info))

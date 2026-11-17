@@ -110,5 +110,10 @@ rejoin the hotspot on its own. If it doesn't: `sudo ghostap recover`.
 
 **F5. If "Try" does nothing:** `journalctl -u ghostap-apply.service -n 40 --no-pager`.
 
+**F6. Logs tab.** Open Logs: "Recent activity" should show your last tests (`ghostap`, `hostapd`,
+`dnsmasq` lines). "Last boot" needs the persistent journal. If it says "Couldn't read the system log",
+send `journalctl -u ghostap-gui -n 20 --no-pager`: the page reads the journal from inside its sandbox,
+which is the one thing not checked off-Pi.
+
 ## Not covered yet
 A logs page, and a link-health check after the AP-to-client switch.

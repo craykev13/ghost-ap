@@ -11,8 +11,8 @@
 
 <main id="login" class="login" hidden>
   <form id="login-form" class="login-card" autocomplete="on">
-    <svg class="logo" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a8 8 0 0 0-8 8v9l2.7-2 2.6 2 2.7-2 2.7 2 2.6-2 2.7 2v-9a8 8 0 0 0-8-8Zm-3 8.5a1.3 1.3 0 1 1 0-2.6 1.3 1.3 0 0 1 0 2.6Zm6 0a1.3 1.3 0 1 1 0-2.6 1.3 1.3 0 0 1 0 2.6Z"/></svg>
-    <h1>GhostAP</h1>
+    <div class="wordmark-box"><img class="wordmark" src="/wordmark.png" alt="GhostAP" width="640" height="103"></div>
+    <h1 class="sr-only">GhostAP admin page</h1>
     <p class="muted">Sign in to the admin page</p>
     <label for="password">Password</label>
     <input id="password" name="password" type="password" autocomplete="current-password" required autofocus>
@@ -24,8 +24,7 @@
 <div id="app" class="shell" hidden>
   <aside class="side">
     <div class="brand">
-      <svg class="logo small" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a8 8 0 0 0-8 8v9l2.7-2 2.6 2 2.7-2 2.7 2 2.6-2 2.7 2v-9a8 8 0 0 0-8-8Zm-3 8.5a1.3 1.3 0 1 1 0-2.6 1.3 1.3 0 0 1 0 2.6Zm6 0a1.3 1.3 0 1 1 0-2.6 1.3 1.3 0 0 1 0 2.6Z"/></svg>
-      <span>GhostAP</span>
+      <img class="wordmark" src="/wordmark.png" alt="GhostAP" width="640" height="103">
     </div>
     <nav class="nav" aria-label="Sections">
       <a id="nav-status" class="nav-item active" href="#status" aria-current="page">

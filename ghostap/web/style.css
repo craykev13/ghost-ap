@@ -29,8 +29,14 @@ h1, h2, h3, p { margin: 0; }
   box-shadow: var(--shadow); padding: 32px 28px; display: grid; gap: 10px; text-align: center; }
 .login-card label { text-align: left; font-size: 13px; color: var(--muted); margin-top: 8px; }
 .login-card h1 { font-size: 22px; }
-.logo { width: 44px; height: 44px; margin: 0 auto 4px; fill: var(--accent); }
-.logo.small { width: 26px; height: 26px; margin: 0; fill: #fff; }
+.wordmark { display: block; width: 100%; height: auto; }
+.wordmark-box { padding: 4px 6px 8px; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0);
+  white-space: nowrap; }
+@media (prefers-color-scheme: light) {
+  /* the lettering is white, so on the white sign-in card it sits on a dark plate */
+  .wordmark-box { background: #111822; border-radius: 10px; padding: 14px 16px; }
+}
 input { width: 100%; padding: 11px 12px; border-radius: 8px; border: 1px solid var(--line);
   background: var(--bg); color: var(--text); font: inherit; }
 input:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
@@ -45,8 +51,7 @@ button.ghost:hover { color: #fff; border-color: #4a5d78; }
 .shell { display: grid; grid-template-columns: 220px 1fr; min-height: 100vh; }
 .side { background: var(--side); color: var(--side-text); padding: 18px 14px; display: flex;
   flex-direction: column; gap: 18px; }
-.brand { display: flex; align-items: center; gap: 10px; color: #fff; font-weight: 700;
-  font-size: 17px; padding: 4px 8px; }
+.brand { padding: 6px 8px 2px; max-width: 190px; }
 .nav { display: grid; gap: 4px; flex: 1; align-content: start; }
 .nav-item { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 8px;
   color: var(--side-text); text-decoration: none; }

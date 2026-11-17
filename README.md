@@ -1,4 +1,6 @@
-# GhostAP
+<p align="center">
+  <img src="assets/wordmark-banner.png" alt="GhostAP" width="480">
+</p>
 
 A Raspberry Pi that always lets you in. At boot it joins a WiFi network it already knows
 (your phone's hotspot, say). If none is around, it raises its own access point so you can

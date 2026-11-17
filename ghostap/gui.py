@@ -35,6 +35,7 @@ STATIC = {                      # the ONLY files ever served: url path -> (file,
     "/": ("index.html", "text/html; charset=utf-8"),
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
     "/style.css": ("style.css", "text/css; charset=utf-8"),
+    "/wordmark.png": ("wordmark.png", "image/png"),
 }
 HASH_NAME = "pbkdf2_sha256"
 ITERATIONS = 100_000            # slow enough to hurt guessing, fast enough for a Pi Zero

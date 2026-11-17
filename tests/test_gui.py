@@ -370,6 +370,27 @@ class ServerTests(Live):
             self.assertNotIn(b"pbkdf2", b)
 
 
+class WordmarkTests(Live):
+    def test_the_wordmark_is_served_as_an_image_without_signing_in(self):
+        s, h, body = self.req("GET", "/wordmark.png")
+        self.assertEqual(s, 200)
+        self.assertEqual(h["content-type"], "image/png")
+        self.assertEqual(body, (WEB / "wordmark.png").read_bytes())
+        self.assertEqual(h["x-content-type-options"], "nosniff")
+
+    def test_it_is_a_real_small_png(self):
+        data = (WEB / "wordmark.png").read_bytes()
+        self.assertEqual(data[:8], b"\x89PNG\r\n\x1a\n")
+        self.assertLess(len(data), 100_000)
+
+    def test_the_page_uses_it_and_the_security_policy_allows_it(self):
+        html = (WEB / "index.html").read_text()
+        self.assertEqual(html.count('src="/wordmark.png"'), 2)       # sign-in and sidebar
+        self.assertIn("img-src 'self'", gui.CSP)
+        self.assertNotIn("<h1>GhostAP</h1>", html)                    # no plain-text title beside it
+        self.assertEqual(len(re.findall(r'<img[^>]*\balt="GhostAP"', html)), 2)
+
+
 class RequestRulesTests(Live):
     def test_posts_need_the_custom_header(self):
         s, h, b = self.req("POST", "/api/login", {"password": PASSWORD}, csrf=False)

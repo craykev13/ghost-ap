@@ -143,3 +143,16 @@ snapshots = true
 
 # Take a second snapshot this long after the AP is up, to see if it degrades.
 snapshot_delay = 90
+
+[gui]
+# Serve the admin web page (run by the ghostap-gui service). It needs a
+# password set with `sudo ghostap gui-password`.
+enabled = false
+
+# Port for the admin page. Open http://<the Pi's address>:<port> in a browser.
+port = 8480
+
+# Which address the admin page listens on. 0.0.0.0 = every network it is on
+# (home WiFi and its own AP). 127.0.0.1 = only the Pi itself. Never exposed to
+# the internet unless your router forwards the port.
+bind = "0.0.0.0"

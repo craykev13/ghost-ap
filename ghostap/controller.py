@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import importlib.util
 import ipaddress
 import json
 import logging
@@ -31,6 +32,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -127,6 +129,10 @@ class Config:
     # Diagnostics
     snapshots: bool = True
     snapshot_delay: int = SNAPSHOT_DELAY
+    # Admin web page
+    gui_enabled: bool = False
+    gui_port: int = 8480
+    gui_bind: str = "0.0.0.0"
 
 
 # --------------------------------------------------------------------------
@@ -297,9 +303,22 @@ SETTINGS: tuple[Setting, ...] = (
     _S("diagnostics", "snapshot_delay", "int", SNAPSHOT_DELAY,
        "Take a second snapshot this long after the AP is up, to see if it degrades.",
        minimum=10, unit=" seconds", advanced=True),
+    # ---- [gui] ----
+    _S("gui", "enabled", "bool", False,
+       "Serve the admin web page (run by the ghostap-gui service). It needs a password "
+       "set with `sudo ghostap gui-password`.", field="gui_enabled"),
+    _S("gui", "port", "int", 8480,
+       "Port for the admin page. Open http://<the Pi's address>:<port> in a browser.",
+       minimum=1024, maximum=65535, field="gui_port"),
+    _S("gui", "bind", "str", "0.0.0.0",
+       "Which address the admin page listens on. 0.0.0.0 = every network it is on "
+       "(home WiFi and its own AP). 127.0.0.1 = only the Pi itself. Never exposed to "
+       "the internet unless your router forwards the port.",
+       field="gui_bind", advanced=True),
 )
 
-_SECTION_ORDER = ("network", "access_point", "dhcp", "recovery", "testing", "diagnostics")
+_SECTION_ORDER = ("network", "access_point", "dhcp", "recovery", "testing", "diagnostics",
+                  "gui")
 _BY_SECTION: dict[str, dict[str, Setting]] = {}
 for _s in SETTINGS:
     _BY_SECTION.setdefault(_s.section, {})[_s.key] = _s
@@ -403,6 +422,11 @@ def validate(cfg: Config) -> None:
     if not lo <= cfg.channel <= hi:
         band = "5 GHz" if cfg.hw_mode == "a" else "2.4 GHz"
         raise GhostAPError(f"channel must be {lo}-{hi} for {band} (hw_mode = \"{cfg.hw_mode}\")")
+    try:
+        ipaddress.ip_address(cfg.gui_bind)
+    except ValueError:
+        raise GhostAPError(f"bind must be an IP address like 0.0.0.0 or 127.0.0.1 "
+                           f"(got {cfg.gui_bind!r})")
     net = cfg.address.network
     for ip in (cfg.dhcp_start, cfg.dhcp_end):
         if ipaddress.IPv4Address(ip) not in net:
@@ -548,11 +572,13 @@ def render_example_config() -> str:
 # --------------------------------------------------------------------------
 
 class Shell:
-    def __init__(self, dry_run: bool = False):
+    def __init__(self, dry_run: bool = False, quiet: bool = False):
         self.dry_run = dry_run
+        self.quiet = quiet          # the admin page polls often; don't log every command
 
     def run(self, *cmd: str, check: bool = True) -> subprocess.CompletedProcess:
-        log.info("$ %s", " ".join(cmd))
+        if not self.quiet:
+            log.info("$ %s", " ".join(cmd))
         if self.dry_run:
             return subprocess.CompletedProcess(cmd, 0, "", "")
         try:
@@ -1301,27 +1327,126 @@ def _seconds_left(state: dict | None, sh: Shell) -> int | None:
     return None if deadline is None else max(0, int(deadline - sh.wallclock()))
 
 
-def cmd_status(cfg: Config, sh: Shell) -> int:
+def collect_status(cfg: Config, sh: Shell) -> dict:
+    """What `status` shows, as data (the admin page reads this too)."""
     state = read_state()
     if _ap_running(sh):
-        print(f"mode: AP  (SSID '{cfg.ssid}', gateway {cfg.address.ip})")
+        mode = "ap"
     elif wifi_connected(sh, cfg.interface):
+        mode = "client"
+    else:
+        mode = "disconnected"
+    live_test = None
+    if state and state.get("purpose") == "test" and state.get("committed") is not True:
+        live_test = {"seconds_left": _seconds_left(state, sh)}
+    armed = sh.run("systemctl", "is-active", f"{RESCUE_UNIT}.timer", check=False)
+    failover = {"enabled": cfg.failover_grace > 0, "grace": cfg.failover_grace,
+                "countdown_running": False}
+    if cfg.failover_grace > 0:
+        fo = sh.run("systemctl", "is-active", f"{FAILOVER_UNIT}.timer", check=False)
+        failover["countdown_running"] = fo.stdout.strip() == "active"
+    return {"mode": mode, "ssid": cfg.ssid, "gateway": str(cfg.address.ip),
+            "live_test": live_test, "rescue_armed": armed.stdout.strip() == "active",
+            "failover": failover}
+
+
+def collect_gui_status(cfg: Config, sh: Shell) -> dict:
+    """collect_status plus the extra facts the admin page shows."""
+    info = collect_status(cfg, sh)
+    addrs = []
+    r = sh.run("ip", "-4", "-o", "addr", "show", "dev", cfg.interface, check=False)
+    for line in r.stdout.splitlines():
+        m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)/", line)
+        if m:
+            addrs.append(m.group(1))
+    info.update({"hostname": socket.gethostname(), "interface": cfg.interface,
+                 "addresses": addrs,
+                 "wifi": current_connection(sh, cfg.interface) if info["mode"] == "client"
+                 else None, "gui_port": cfg.gui_port})
+    return info
+
+
+def cmd_status(cfg: Config, sh: Shell) -> int:
+    st = collect_status(cfg, sh)
+    if st["mode"] == "ap":
+        print(f"mode: AP  (SSID '{cfg.ssid}', gateway {cfg.address.ip})")
+    elif st["mode"] == "client":
         print("mode: client (connected to WiFi)")
     else:
         print("mode: disconnected (no AP, no WiFi)")
-    if state and state.get("purpose") == "test" and state.get("committed") is not True:
-        left = _seconds_left(state, sh)
+    if st["live_test"] is not None:
+        left = st["live_test"]["seconds_left"]
         when = f"rolls back in ~{left}s" if left is not None else "rolls back on its own"
         print(f"live test: UNCOMMITTED, {when}. "
               "Keep it: ghostap test --commit   Revert now: ghostap test --abort")
-    armed = sh.run("systemctl", "is-active", f"{RESCUE_UNIT}.timer", check=False)
-    print("rescue timer: " + ("armed" if armed.stdout.strip() == "active" else "not armed"))
-    if cfg.failover_grace > 0:
-        fo = sh.run("systemctl", "is-active", f"{FAILOVER_UNIT}.timer", check=False)
-        print(f"failover: on ({cfg.failover_grace}s grace), countdown "
-              + ("RUNNING" if fo.stdout.strip() == "active" else "not running"))
+    print("rescue timer: " + ("armed" if st["rescue_armed"] else "not armed"))
+    fo = st["failover"]
+    if fo["enabled"]:
+        print(f"failover: on ({fo['grace']}s grace), countdown "
+              + ("RUNNING" if fo["countdown_running"] else "not running"))
     else:
         print("failover: off")
+    if cfg.gui_enabled:
+        print(f"admin page: port {cfg.gui_port} (http://{socket.gethostname()}.local:"
+              f"{cfg.gui_port})")
+    return 0
+
+
+GUI_PASSWORD_FILE = Path("/etc/ghostap/gui-password")
+
+
+def _gui_module():
+    """gui.py sits next to this file. Loaded only when needed, so the controller
+    (which runs the boot logic) never depends on the web code."""
+    mod = sys.modules.get("ghostap_gui")
+    if mod is None:
+        spec = importlib.util.spec_from_file_location(
+            "ghostap_gui", Path(__file__).resolve().parent / "gui.py")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+    return mod
+
+
+def cmd_gui(cfg: Config, sh: Shell) -> int:
+    if not cfg.gui_enabled:
+        log.error("the admin page is off. Turn it on with `enabled = true` under [gui] "
+                  "in %s", cfg.path)
+        return 1
+    gui = _gui_module()
+    cred = os.environ.get("CREDENTIALS_DIRECTORY")
+    pw_file = Path(cred) / "gui-password" if cred else GUI_PASSWORD_FILE
+    stored = gui.read_password_hash(pw_file)
+    if stored is None:
+        log.error("no admin password is set. Run: sudo ghostap gui-password")
+        return 1
+    quiet = Shell(quiet=True)
+    try:
+        server = gui.make_server(lambda: collect_gui_status(cfg, quiet), stored,
+                                 cfg.gui_bind, cfg.gui_port)
+    except OSError as e:
+        raise GhostAPError(f"can't listen on {cfg.gui_bind}:{cfg.gui_port}: {e}")
+    log.info("admin page on http://%s:%s", cfg.gui_bind, cfg.gui_port)
+    try:
+        server.serve_forever()
+    except Interrupted:
+        pass
+    finally:
+        server.server_close()
+    return 0
+
+
+def cmd_gui_password() -> int:
+    import getpass
+    gui = _gui_module()
+    pw = getpass.getpass("New admin page password (8+ characters): ")
+    if pw != getpass.getpass("Type it again: "):
+        raise GhostAPError("those didn't match")
+    try:
+        gui.write_password_file(GUI_PASSWORD_FILE, pw)
+    except (ValueError, OSError) as e:
+        raise GhostAPError(f"couldn't save the password: {e}")
+    print(f"Saved. Restart the page to use it: sudo systemctl restart ghostap-gui")
     return 0
 
 
@@ -1609,12 +1734,13 @@ def cmd_preflight(cfg: Config, sh: Shell) -> int:
 
 
 # Commands that only look, so they don't read the passphrase file (and don't need root to).
-READ_ONLY = ("status", "preflight")
+READ_ONLY = ("status", "preflight", "gui")
 
 COMMANDS = {"start": cmd_start, "stop": cmd_stop, "status": cmd_status,
             "recover": cmd_recover, "test": cmd_test_start,
             "failover": cmd_failover, "event": cmd_event,
-            "snapshot": cmd_snapshot, "preflight": cmd_preflight, "schema": None, "example-config": None}
+            "snapshot": cmd_snapshot, "preflight": cmd_preflight, "gui": cmd_gui, "gui-password": None,
+            "schema": None, "example-config": None}
 
 
 def _install_signal_handlers() -> None:
@@ -1685,6 +1811,13 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(settings_schema(), indent=2) if args.command == "schema"
               else render_example_config(), end="" if args.command == "example-config" else "\n")
         return 0
+
+    if args.command == "gui-password":
+        try:
+            return cmd_gui_password()
+        except GhostAPError as e:
+            print(f"ERROR {e}", file=sys.stderr)
+            return 1
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     _setup_file_log(args.dry_run)

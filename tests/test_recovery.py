@@ -28,6 +28,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -2063,7 +2064,7 @@ class ReadOnlyCommandTests(unittest.TestCase):
             ctl.render_hostapd(cfg)
 
     def test_only_looking_commands_are_read_only(self):
-        self.assertEqual(set(ctl.READ_ONLY), {"status", "preflight"})
+        self.assertEqual(set(ctl.READ_ONLY), {"status", "preflight", "gui"})
         for cmd in ("start", "stop", "recover", "test", "failover", "event"):
             self.assertNotIn(cmd, ctl.READ_ONLY)
 
@@ -2076,6 +2077,243 @@ class ReadOnlyCommandTests(unittest.TestCase):
             rc = ctl.main(["status", "-c", str(path)])
         self.assertEqual(rc, 0)
         self.assertEqual(m.call_args.args[0].passphrase, ctl._UNREAD_SECRET)
+
+
+class StubShell(ctl.Shell):
+    """Answers read-only commands from a table, so status can be checked in every mode."""
+
+    def __init__(self, answers=None, **kw):
+        super().__init__(dry_run=False, **kw)
+        self.answers, self.seen = answers or {}, []
+
+    def run(self, *cmd, check=True):
+        self.seen.append(cmd)
+        out = ""
+        for prefix, text in self.answers.items():
+            if cmd[:len(prefix)] == prefix:
+                out = text
+        return subprocess.CompletedProcess(cmd, 0, out, "")
+
+    def pid_alive(self, pid):
+        return pid in self.alive
+
+    alive = ()
+
+
+class AdminPageControllerTests(Base):
+    """The controller's side of the admin page: settings, status as data, the commands."""
+
+    def write_config(self, body=""):
+        d = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        (d / "pw").write_text("testpass123\n")
+        os.chmod(d / "pw", 0o600)
+        (d / "c.toml").write_text(
+            f'[access_point]\nssid = "ZeroFi"\npassphrase_file = "{d / "pw"}"\n'
+            '[dhcp]\nstart = "192.168.4.10"\nend = "192.168.4.50"\n' + body)
+        return d / "c.toml"
+
+    # ---- settings ----
+    def test_the_page_is_off_by_default_with_sensible_defaults(self):
+        cfg = ctl.load_config(self.write_config())
+        self.assertEqual((cfg.gui_enabled, cfg.gui_port, cfg.gui_bind), (False, 8480, "0.0.0.0"))
+
+    def test_the_page_settings_load(self):
+        cfg = ctl.load_config(self.write_config(
+            '[gui]\nenabled = true\nport = 9000\nbind = "127.0.0.1"\n'))
+        self.assertEqual((cfg.gui_enabled, cfg.gui_port, cfg.gui_bind), (True, 9000, "127.0.0.1"))
+
+    def test_bad_port_and_bind_are_refused(self):
+        for body, word in (("port = 80", "port"), ("port = 70000", "port"),
+                           ("port = 1023", "port"), ('bind = "localhost"', "bind"),
+                           ('bind = "256.1.1.1"', "bind"), ('bind = ""', "bind"),
+                           ('bind = "all"', "bind")):
+            with self.assertRaises(ctl.GhostAPError, msg=body) as cm:
+                ctl.load_config(self.write_config(f"[gui]\n{body}\n"))
+            self.assertIn(word, str(cm.exception))
+        for ok in ('bind = "::1"', 'bind = "::"', "port = 1024", "port = 65535"):
+            ctl.load_config(self.write_config(f"[gui]\n{ok}\n"))
+
+    def test_the_settings_show_up_in_the_schema_and_example_config(self):
+        keys = {(x["section"], x["key"]) for x in ctl.settings_schema()}
+        self.assertTrue({("gui", "enabled"), ("gui", "port"), ("gui", "bind")} <= keys)
+        self.assertIn("[gui]", ctl.render_example_config())
+
+    # ---- status as data ----
+    def status(self, *, alive=(), connected=False, state=None, rescue=False, failover=False,
+               cfg=None, extra=None):
+        answers = {("nmcli", "-t", "-f", "DEVICE,TYPE,STATE", "device"):
+                   "wlan0:wifi:connected\n" if connected else "wlan0:wifi:disconnected\n",
+                   ("systemctl", "is-active", f"{ctl.RESCUE_UNIT}.timer"):
+                   "active\n" if rescue else "inactive\n",
+                   ("systemctl", "is-active", f"{ctl.FAILOVER_UNIT}.timer"):
+                   "active\n" if failover else "inactive\n"}
+        answers.update(extra or {})
+        sh = StubShell(answers)
+        sh.alive = set(alive)
+        for leftover in (ctl.HOSTAPD_PID, ctl.STATE_FILE):       # every call starts clean
+            leftover.unlink(missing_ok=True)
+        if alive:
+            ctl.RUN_DIR.mkdir(parents=True, exist_ok=True)
+            ctl.HOSTAPD_PID.write_text("4242\n")
+        if state is not None:
+            ctl.RUN_DIR.mkdir(parents=True, exist_ok=True)
+            ctl.STATE_FILE.write_text(json.dumps(state))
+        return sh, ctl.collect_status(cfg or self.cfg, sh)
+
+    def test_status_data_in_each_mode(self):
+        self.assertEqual(self.status(connected=True)[1]["mode"], "client")
+        self.assertEqual(self.status()[1]["mode"], "disconnected")
+        sh, st = self.status(alive={4242}, connected=True)
+        self.assertEqual((st["mode"], st["ssid"], st["gateway"]), ("ap", "ZeroFi", "192.168.4.1"))
+
+    def test_status_data_shows_a_live_test_and_the_rescue_timer(self):
+        sh, st = self.status(connected=True, rescue=True, state={
+            "purpose": "test", "committed": False, "deadline": sh_now() + 50})
+        self.assertTrue(st["rescue_armed"])
+        self.assertAlmostEqual(st["live_test"]["seconds_left"], 50, delta=3)
+        self.assertIsNone(self.status(connected=True)[1]["live_test"])
+        self.assertIsNone(self.status(connected=True, state={
+            "purpose": "test", "committed": True, "deadline": 1})[1]["live_test"])
+
+    def test_status_data_failover(self):
+        import dataclasses
+        cfg = dataclasses.replace(self.cfg, failover_grace=120)
+        fo = self.status(cfg=cfg, failover=True)[1]["failover"]
+        self.assertEqual(fo, {"enabled": True, "grace": 120, "countdown_running": True})
+        fo = self.status(cfg=cfg)[1]["failover"]
+        self.assertFalse(fo["countdown_running"])
+        fo = self.status()[1]["failover"]
+        self.assertEqual((fo["enabled"], fo["countdown_running"]), (False, False))
+
+    def test_the_page_status_adds_address_wifi_name_and_hostname(self):
+        answers = {("ip", "-4", "-o", "addr", "show", "dev", "wlan0"):
+                   "3: wlan0    inet 192.168.1.50/24 brd 192.168.1.255 scope global wlan0\n"
+                   "3: wlan0    inet 10.0.0.9/8 scope global secondary wlan0\n",
+                   ("nmcli", "-g", "GENERAL.CONNECTION", "device", "show", "wlan0"): "crashbandiclute\n"}
+        sh, _ = self.status(connected=True, extra=answers)
+        st = ctl.collect_gui_status(self.cfg, sh)
+        self.assertEqual(st["addresses"], ["192.168.1.50", "10.0.0.9"])
+        self.assertEqual(st["wifi"], "crashbandiclute")
+        self.assertEqual((st["interface"], st["gui_port"]), ("wlan0", 8480))
+        self.assertTrue(st["hostname"])
+        json.dumps(st)                              # must be sendable as JSON
+
+    def test_the_page_status_has_no_wifi_name_when_not_on_wifi(self):
+        sh, _ = self.status()
+        self.assertIsNone(ctl.collect_gui_status(self.cfg, sh)["wifi"])
+
+    def test_the_page_status_never_contains_the_password(self):
+        sh, _ = self.status(connected=True)
+        self.assertNotIn(self.cfg.passphrase, json.dumps(ctl.collect_gui_status(self.cfg, sh)))
+
+    def test_status_text_mentions_the_page_only_when_it_is_on(self):
+        import dataclasses
+        for enabled in (False, True):
+            cfg = dataclasses.replace(self.cfg, gui_enabled=enabled)
+            sh, _ = self.status(connected=True, cfg=cfg)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                ctl.cmd_status(cfg, sh)
+            self.assertEqual("admin page:" in out.getvalue(), enabled)
+            if enabled:
+                self.assertIn(":8480", out.getvalue())
+
+    def test_a_quiet_shell_does_not_log_each_command(self):
+        with SettingsTests.logs_enabled():
+            with self.assertLogs(ctl.log, "INFO") as normal:         # control: it DOES log
+                ctl.Shell().run("true", check=False)
+            self.assertTrue(normal.records)
+            with self.assertNoLogs(ctl.log, "INFO"):
+                ctl.Shell(quiet=True).run("true", check=False)
+
+    # ---- the commands ----
+    def gui_env(self, *, password=True, enabled=True):
+        import dataclasses
+        d = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        gui = ctl._gui_module()
+        if password:
+            gui.write_password_file(d / "gui-password", "adminpass123")
+        p = mock.patch.dict(os.environ, {"CREDENTIALS_DIRECTORY": str(d)})
+        p.start()
+        self.addCleanup(p.stop)
+        return gui, dataclasses.replace(self.cfg, gui_enabled=enabled, gui_port=9123,
+                                        gui_bind="127.0.0.1")
+
+    def test_gui_command_starts_the_server_with_the_configured_address(self):
+        gui, cfg = self.gui_env()
+        seen = {}
+
+        class FakeServer:
+            def serve_forever(self):
+                raise ctl.Interrupted("stop")        # what systemd's stop signal does
+
+            def server_close(self):
+                seen["closed"] = True
+
+        def fake_make(provider, stored, host, port):
+            seen.update(provider=provider, stored=stored, host=host, port=port)
+            return FakeServer()
+        with mock.patch.object(gui, "make_server", fake_make):
+            self.assertEqual(ctl.cmd_gui(cfg, StubShell()), 0)
+        self.assertEqual((seen["host"], seen["port"]), ("127.0.0.1", 9123))
+        self.assertTrue(gui.verify_password("adminpass123", seen["stored"]))
+        self.assertTrue(seen["closed"])
+        info = seen["provider"]()
+        self.assertEqual(info["mode"], "disconnected")
+        self.assertNotIn("testpass123", json.dumps(info))
+
+    def test_gui_command_refuses_when_off_or_without_a_password(self):
+        gui, cfg = self.gui_env(enabled=False)
+        with mock.patch.object(gui, "make_server") as m:
+            self.assertEqual(ctl.cmd_gui(cfg, StubShell()), 1)
+            m.assert_not_called()
+        gui, cfg = self.gui_env(password=False)
+        with mock.patch.object(gui, "make_server") as m:
+            self.assertEqual(ctl.cmd_gui(cfg, StubShell()), 1)
+            m.assert_not_called()
+
+    def test_gui_command_says_so_when_the_port_is_taken(self):
+        gui, cfg = self.gui_env()
+        with mock.patch.object(gui, "make_server", side_effect=OSError("Address in use")):
+            with self.assertRaises(ctl.GhostAPError) as cm:
+                ctl.cmd_gui(cfg, StubShell())
+        self.assertIn("9123", str(cm.exception))
+
+    def test_gui_password_command_saves_a_hash_and_checks_the_retype(self):
+        d = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        target = d / "gui-password"
+        with mock.patch.object(ctl, "GUI_PASSWORD_FILE", target), \
+                mock.patch("getpass.getpass", side_effect=["adminpass123", "adminpass123"]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(ctl.main(["gui-password"]), 0)
+        self.assertTrue(ctl._gui_module().verify_password("adminpass123", target.read_text()))
+        self.assertNotIn("adminpass123", target.read_text())
+        target.unlink()
+        with mock.patch.object(ctl, "GUI_PASSWORD_FILE", target), \
+                mock.patch("getpass.getpass", side_effect=["adminpass123", "different123"]), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(ctl.main(["gui-password"]), 1)
+        self.assertFalse(target.exists())
+        with mock.patch.object(ctl, "GUI_PASSWORD_FILE", target), \
+                mock.patch("getpass.getpass", side_effect=["short", "short"]), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(ctl.main(["gui-password"]), 1)
+        self.assertFalse(target.exists())
+
+    def test_the_gui_never_needs_the_ap_password_to_start(self):
+        # the service user can't read /etc/ghostap/passphrase, and shouldn't need to
+        path = self.write_config('[gui]\nenabled = true\n')
+        (path.parent / "pw").unlink()
+        cfg = ctl.load_config(path, secrets=False)
+        self.assertTrue(cfg.gui_enabled)
+        self.assertIn("gui", ctl.READ_ONLY)
+
+
+def sh_now():
+    return time.time()
 
 
 if __name__ == "__main__":

@@ -2252,14 +2252,17 @@ class AdminPageControllerTests(Base):
             def server_close(self):
                 seen["closed"] = True
 
-        def fake_make(provider, stored, host, port):
-            seen.update(provider=provider, stored=stored, host=host, port=port)
+        def fake_make(provider, stored, host, port, settings=None):
+            seen.update(provider=provider, stored=stored, host=host, port=port,
+                        settings=settings)
             return FakeServer()
         with mock.patch.object(gui, "make_server", fake_make):
             self.assertEqual(ctl.cmd_gui(cfg, StubShell()), 0)
         self.assertEqual((seen["host"], seen["port"]), ("127.0.0.1", 9123))
         self.assertTrue(gui.verify_password("adminpass123", seen["stored"]))
         self.assertTrue(seen["closed"])
+        self.assertIsInstance(seen["settings"], ctl.SettingsStore)
+        self.assertEqual(seen["settings"].path, cfg.path)
         info = seen["provider"]()
         self.assertEqual(info["mode"], "disconnected")
         self.assertNotIn("testpass123", json.dumps(info))

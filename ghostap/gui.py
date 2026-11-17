@@ -41,7 +41,7 @@ ITERATIONS = 100_000            # slow enough to hurt guessing, fast enough for 
 MAX_ITERATIONS = 1_000_000      # refuse absurd values from a tampered file (would hang us)
 MIN_PASSWORD = 8
 MAX_PASSWORD = 128
-MAX_BODY = 8 * 1024
+MAX_BODY = 32 * 1024
 SESSION_IDLE = 60 * 60          # signed out after an hour of nothing
 SESSION_MAX = 12 * 60 * 60      # and never stays signed in longer than half a day
 LOGIN_FAILS = 5
@@ -181,7 +181,8 @@ class Cached:
 # ---- the web server ---------------------------------------------------------------------
 
 class App:
-    def __init__(self, provider, password_hash: str, clock=time.monotonic):
+    def __init__(self, provider, password_hash: str, clock=time.monotonic, settings=None):
+        self.settings = settings        # something with get() and save(changes, version)
         self.auth = Auth(password_hash, clock)
         self.status = Cached(provider, clock=clock)
 
@@ -285,10 +286,36 @@ def make_handler(app: App):
                 except Exception:           # never show the person a traceback
                     log.exception("status failed")
                     return self._error(500, "couldn't read the status")
+            if path == "/api/settings" and app.settings is not None:
+                if not self._authed():
+                    return self._error(401, "sign in first")
+                try:
+                    return self._json(200, app.settings.get())
+                except Exception:
+                    log.exception("reading settings failed")
+                    return self._error(500, "couldn't read the settings")
             return self._error(404, "not found")
+
+        def _save_settings(self, data):
+            changes, version = data.get("changes"), data.get("version")
+            if not isinstance(changes, dict) or not isinstance(version, str):
+                return self._error(400, "expected changes and version")
+            try:
+                return self._json(200, {"ok": True, **app.settings.save(changes, version)})
+            except app.settings.Rejected as e:
+                body = {"error": str(e), "fields": e.fields}
+                return self._json(409 if e.conflict else 400, body)
+            except Exception:
+                log.exception("saving settings failed")
+                return self._error(500, "couldn't save the settings")
 
         def do_POST(self):
             path = self.path.split("?", 1)[0]
+            if path == "/api/settings" and app.settings is not None:
+                if not self._authed():
+                    return self._error(401, "sign in first")
+                data = self._same_origin_json_post()
+                return None if data is None else self._save_settings(data)
             if path not in ("/api/login", "/api/logout"):
                 return self._error(404, "not found")
             data = self._same_origin_json_post()
@@ -322,10 +349,10 @@ def make_handler(app: App):
 
 
 def make_server(provider, password_hash: str, host: str, port: int,
-                clock=time.monotonic) -> ThreadingHTTPServer:
+                clock=time.monotonic, settings=None) -> ThreadingHTTPServer:
     if not password_hash:
         raise ValueError("no admin password is set")
-    app = App(provider, password_hash, clock)
+    app = App(provider, password_hash, clock, settings)
     server = ThreadingHTTPServer((host, port), make_handler(app))
     server.daemon_threads = True
     server.app = app

@@ -28,14 +28,14 @@
       <span>GhostAP</span>
     </div>
     <nav class="nav" aria-label="Sections">
-      <a class="nav-item active" aria-current="page">
+      <a id="nav-status" class="nav-item active" href="#status" aria-current="page">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 13h4l3-8 4 14 3-6h4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
         Status
       </a>
-      <span class="nav-item soon" aria-disabled="true">
+      <a id="nav-settings" class="nav-item" href="#settings">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h10M18 7h2M4 17h2M10 17h10" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="16" cy="7" r="2" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="8" cy="17" r="2" fill="none" stroke="currentColor" stroke-width="2"/></svg>
-        Settings <em>soon</em>
-      </span>
+        Settings
+      </a>
       <span class="nav-item soon" aria-disabled="true">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14M5 10h14M5 15h9M5 20h6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
         Logs <em>soon</em>
@@ -46,12 +46,26 @@
 
   <section class="main">
     <header class="top">
-      <h2>Status</h2>
+      <h2 id="title">Status</h2>
       <span id="pill" class="pill">Loading</span>
     </header>
     <p id="banner" class="banner" role="status" hidden></p>
-    <div id="cards" class="cards"></div>
-    <p id="updated" class="muted small"></p>
+    <div id="status-view">
+      <div id="cards" class="cards"></div>
+      <p id="updated" class="muted small"></p>
+    </div>
+    <form id="settings-view" class="settings" hidden novalidate>
+      <p class="note">Changes are saved to the config file. They are <strong>not live yet</strong>:
+        they apply the next time the Pi starts its own network, or when you run
+        <code>sudo ghostap test</code>, which undoes itself if something goes wrong.</p>
+      <div id="settings-body"></div>
+      <label class="check"><input id="show-advanced" type="checkbox"> Show advanced settings</label>
+      <p id="settings-msg" class="form-msg" role="status"></p>
+      <div class="actions">
+        <button id="settings-save" class="primary" type="submit" disabled>Save changes</button>
+        <button id="settings-undo" class="secondary" type="button" disabled>Undo edits</button>
+      </div>
+    </form>
   </section>
 </div>
 

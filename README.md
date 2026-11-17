@@ -39,9 +39,12 @@ Unattended: `sudo python3 install.py --yes --generate-password --ssid MyPi --cou
 ## Admin page (preview)
 
 A small web page, served by the Pi itself, that shows what it's doing: connected or running
-its own network, addresses, the safety timer and failover. It uses no internet and loads
-nothing from outside. This first version is **read-only**; changing settings from the page
-comes next. The installer offers it: say yes, pick (or generate) an admin password, and it
+its own network, addresses, the safety timer and failover, and a **Settings** tab where you
+can edit the config (network name, channel, addresses, timers and so on) without SSH. It uses
+no internet and loads nothing from outside. Saving writes the config file (your comments stay,
+and the previous copy is kept as `ghostap.toml.bak`) but doesn't change the live network:
+changes apply at the next boot fallback, or try them safely now with `sudo ghostap test`.
+The admin password, and the admin page's own port and address, are still changed over SSH. The installer offers it: say yes, pick (or generate) an admin password, and it
 installs and enables the page, then prints the address when it finishes. Unattended, use
 `--admin-password-file FILE` or `--generate-admin-password`, and `--no-admin-page` to skip it.
 `ghostap status` shows the address too.
@@ -76,5 +79,5 @@ yet; `ghostap preflight` says so instead of guessing.
 
 ## Status
 
-Works and is tested (an automated test suite, plus real-hardware runs). Planned: changing settings from the
-admin page, link-health checks after the AP-to-client switch, other network setups.
+Works and is tested (an automated test suite, plus real-hardware runs). Planned: applying changes from the
+admin page, a logs page, link-health checks after the AP-to-client switch, other network setups.

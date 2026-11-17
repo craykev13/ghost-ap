@@ -459,6 +459,11 @@ class ServiceFileTests(unittest.TestCase):
     def test_it_restarts_if_it_dies(self):
         self.assertIn("Restart=on-failure", self.unit)
 
+    def test_it_may_write_only_the_config_folder(self):
+        # the Settings page saves the config; nothing else on the system becomes writable
+        self.assertEqual(re.findall(r"(?m)^ReadWritePaths=(.*)$", self.unit), ["/etc/ghostap"])
+        self.assertIn("ProtectSystem=strict", self.unit)
+
 
 class PageFilesTests(unittest.TestCase):
     """The page must work offline and must not be able to run anything from outside."""

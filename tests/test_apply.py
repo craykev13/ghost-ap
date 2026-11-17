@@ -95,6 +95,15 @@ class ApplierTests(Folder):
     def test_two_requests_at_once_cannot_both_get_in(self):
         a = self.applier()
         out = []
+        real_replace = os.replace
+
+        def slow_replace(src, dst):         # widen the window so a missing lock shows up
+            import time
+            time.sleep(0.15)
+            real_replace(src, dst)
+        p = mock.patch.object(ctl.os, "replace", slow_replace)
+        p.start()
+        self.addCleanup(p.stop)
 
         def go(action):
             try:
@@ -294,6 +303,15 @@ class RouteTests(unittest.TestCase):
         r.read()
         c.close()
         self.assertEqual(r.status, 404)
+
+
+class PageTests(unittest.TestCase):
+    def test_the_page_only_ever_asks_for_the_three_known_actions(self):
+        import re
+        js = (ROOT / "ghostap" / "web" / "app.js").read_text()
+        asked = set(re.findall(r'sendApply\("(\w+)"\)', js))
+        asked |= set(re.findall(r'\["[^"]+", "(\w+)", "(?:primary|secondary)"\]', js))
+        self.assertEqual(asked, set(ctl.APPLY_ACTIONS))
 
 
 class UnitFileTests(unittest.TestCase):

@@ -202,7 +202,7 @@ async function sendApply(action) {
         + "Join the Pi's network and open it there (steps above).", cls: "ok" };
     } else {
       applyMsg = { text: action === "commit" ? "Keeping it..." : "Reverting...", cls: "ok" };
-      setTimeout(refresh, 2500);
+      setTimeout(refresh, 3500);      // the Pi caches its status for 3 s
     }
   } catch (e) {
     applyMsg = { text: "Can't reach the Pi. If it switched networks, follow the steps above.", cls: "bad" };
@@ -457,7 +457,7 @@ $("settings-view").addEventListener("submit", async (ev) => {
     if (r.ok) {
       const n = r.data.saved.length;
       await loadSettings();
-      setMessage("Saved " + n + " setting" + (n === 1 ? "" : "s") + ". Not live yet: it applies at the next boot of the fallback network, or try it now with: sudo ghostap test", "ok");
+      setMessage("Saved " + n + " setting" + (n === 1 ? "" : "s") + ". Not live yet. Use \"Try the saved settings\" below to test it safely.", "ok");
       return;
     }
     const fields = (r.data && r.data.fields) || {};
@@ -490,7 +490,10 @@ function route() {
     $("nav-settings").setAttribute("aria-current", "page");
     if (!form) loadSettings();
     refresh();
-  } else $("nav-settings").removeAttribute("aria-current");
+  } else {
+    $("nav-settings").removeAttribute("aria-current");
+    if (lastStatus) refresh();
+  }
 }
 window.addEventListener("hashchange", route);
 

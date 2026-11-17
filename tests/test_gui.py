@@ -427,6 +427,39 @@ class RequestRulesTests(Live):
                 gui.make_server(lambda: {}, pw, "127.0.0.1", 0)
 
 
+class ServiceFileTests(unittest.TestCase):
+    """The first real run failed because the service hid /home from a program that lives in
+    /home. These pin down what has to be true of the unit file."""
+
+    unit = (ROOT / "systemd" / "ghostap-gui.service").read_text()
+
+    def test_it_can_read_the_program_in_a_home_folder(self):
+        self.assertNotIn("DynamicUser", self.unit)
+        self.assertNotRegex(self.unit, r"(?m)^ProtectHome=(yes|true|tmpfs)")
+        self.assertIn("ProtectHome=read-only", self.unit)
+        self.assertIn("CAP_DAC_READ_SEARCH", self.unit)
+
+    def test_it_is_still_locked_down(self):
+        for line in ("NoNewPrivileges=yes", "ProtectSystem=strict", "PrivateTmp=yes",
+                     "CapabilityBoundingSet=CAP_DAC_READ_SEARCH"):
+            self.assertIn(line, self.unit)
+        caps = re.search(r"(?m)^CapabilityBoundingSet=(.*)$", self.unit).group(1).split()
+        self.assertEqual(caps, ["CAP_DAC_READ_SEARCH"])        # nothing else
+
+    def test_it_starts_the_same_command_the_boot_service_uses(self):
+        boot = (ROOT / "systemd" / "ghostap.service").read_text()
+        cmd = "/usr/bin/python3 /usr/local/bin/ghostap"
+        self.assertIn(f"ExecStart={cmd} gui", self.unit)
+        self.assertIn(cmd, boot)
+
+    def test_a_missing_run_folder_does_not_stop_it_starting(self):
+        # /run/ghostap only exists once an AP has been raised
+        self.assertIn("ReadOnlyPaths=-/run/ghostap", self.unit)
+
+    def test_it_restarts_if_it_dies(self):
+        self.assertIn("Restart=on-failure", self.unit)
+
+
 class PageFilesTests(unittest.TestCase):
     """The page must work offline and must not be able to run anything from outside."""
 

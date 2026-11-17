@@ -53,7 +53,8 @@ sudo systemctl daemon-reload && sudo systemctl enable --now ghostap-gui
 Then open `http://<hostname>.local:8480` (for example `http://zerofi.local:8480`) or the Pi's
 IP address with `:8480`. When the Pi is running its own network, that's `http://192.168.4.1:8480`.
 The port and listen address are settings under `[gui]`. Sign-in is rate-limited, the page runs
-as an unprivileged throwaway user, and it is plain HTTP, so keep it on networks you trust.
+sandboxed (almost every privilege removed, rest of the system read-only), and it is plain HTTP,
+so keep it on networks you trust.
 
 ## What it needs
 

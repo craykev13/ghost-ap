@@ -3,22 +3,23 @@ Description=GhostAP admin page
 After=network.target
 
 [Service]
-# Runs as a throwaway unprivileged user. It can look at the system but not change it.
-DynamicUser=yes
-# The password hash is handed to the service privately by systemd; the service user
-# itself can't read /etc/ghostap/gui-password.
-LoadCredential=gui-password:/etc/ghostap/gui-password
+# The `ghostap` command is a link into the cloned repo, which lives in a home folder, so
+# this can't run as a throwaway user (it couldn't open its own program). It runs as root
+# with every privilege removed except the one that lets it read that folder, and with the
+# rest of the system mounted read-only.
 ExecStart=/usr/bin/python3 /usr/local/bin/ghostap gui
 Restart=on-failure
 RestartSec=5
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
 NoNewPrivileges=yes
 ProtectSystem=strict
-ProtectHome=yes
+ProtectHome=read-only
 PrivateTmp=yes
 ProtectKernelTunables=yes
+ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
-ReadOnlyPaths=/etc/ghostap -/run/ghostap
+ReadOnlyPaths=-/run/ghostap
 
 [Install]
 WantedBy=multi-user.target

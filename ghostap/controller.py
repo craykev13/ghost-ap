@@ -1820,7 +1820,8 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    _setup_file_log(args.dry_run)
+    # commands that only look must not write into the log a live test is relying on
+    _setup_file_log(args.dry_run or args.command in READ_ONLY)
     _install_signal_handlers()
     try:
         if args.command == "preflight" and not args.config.exists():

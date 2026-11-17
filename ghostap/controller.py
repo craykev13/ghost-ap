@@ -28,6 +28,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -345,7 +346,6 @@ def _read_secret(path: Path) -> str:
 
 
 def _check_extra_lines(setting: str, lines, *, fixed, named, key_re: str) -> None:
-    import re
     pattern = re.compile(key_re)
     for line in lines:
         if not isinstance(line, str) or not line.strip():
@@ -393,6 +393,9 @@ def validate(cfg: Config) -> None:
         raise GhostAPError("passphrase must be 8-63 ASCII characters")
     if not (1 <= len(cfg.ssid.encode()) <= 32) or "\n" in cfg.ssid:
         raise GhostAPError("ssid must be 1-32 bytes with no newlines")
+    if not re.fullmatch(r"[A-Za-z0-9]{2}", cfg.country):
+        raise GhostAPError("country must be a two-letter code like US or GB "
+                           f"(got {cfg.country!r})")
     # Which channels exist depends on the band. Whether one is LEGAL where you are is
     # for hostapd and the country code to say; a refusal shows up as an AP that fails
     # to start, which GhostAP rolls back from.
@@ -1417,6 +1420,7 @@ class Finding:
     title: str
     detail: str = ""
     fix: str = ""
+    code: str = ""      # machine-readable tag, e.g. "missing:hostapd" (installer uses it)
 
 
 @dataclass
@@ -1471,7 +1475,6 @@ def gather_facts(sh: Shell, iface: str = "wlan0") -> HostFacts:
     f.ap_mode = _ap_supported(out) if rc == 0 else None
     rc, out = sh.probe("iw", "reg", "get")
     if rc == 0:
-        import re
         m = re.search(r"country (\w\w):", out)
         f.reg_country = m.group(1) if m else None
     if f.active.get("NetworkManager") == "active" and f.tools.get("nmcli"):
@@ -1495,7 +1498,8 @@ def gather_facts(sh: Shell, iface: str = "wlan0") -> HostFacts:
 
 def judge(f: HostFacts) -> list:
     out: list = []
-    add = lambda *a, **k: out.append(Finding(*a, **k))
+    def add(*a, **k):
+        out.append(Finding(*a, **k))
     active = lambda svc: f.active.get(svc) == "active"
 
     if not f.has_systemd:
@@ -1519,7 +1523,8 @@ def judge(f: HostFacts) -> list:
 
     for tool, pkg in (("hostapd", "hostapd"), ("dnsmasq", "dnsmasq-base"), ("iw", "iw")):
         if not f.tools.get(tool, True):
-            add(BLOCK, f"{tool} isn't installed", "", f"sudo apt install {pkg}")
+            add(BLOCK, f"{tool} isn't installed", "", f"sudo apt install {pkg}",
+                code=f"missing:{tool}")
     for tool in ("systemd-run", "ip"):
         if not f.tools.get(tool, True):
             add(BLOCK, f"{tool} isn't installed", "GhostAP needs it.")

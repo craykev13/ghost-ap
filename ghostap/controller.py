@@ -1943,7 +1943,7 @@ def _write_apply_result(action, ok: bool, message: str) -> None:
     RUN_DIR.mkdir(mode=0o755, parents=True, exist_ok=True)
     _write_private(APPLY_RESULT, json.dumps(
         {"action": action, "ok": ok, "message": message, "at": int(time.time())}))
-    os.chmod(APPLY_RESULT, 0o644)
+    os.chmod(APPLY_RESULT, 0o600)      # the page runs as root too, so it can still read it
 
 
 def cmd_apply_request(cfg: Config, sh: Shell) -> int:

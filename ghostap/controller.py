@@ -1970,7 +1970,7 @@ class LogReader:
     """Which logs the page can show. `runner(argv)` returns (exit code, text); tests swap it."""
     SOURCES = {
         "activity": "Recent activity",
-        "previous_boot": "Last boot",
+        "previous_boot": "Before the last reboot",
         "test": "Last live test",
         "snapshots": "Radio snapshots",
     }
@@ -2014,9 +2014,11 @@ class LogReader:
             good = [text for rc, text in results if rc == 0]
             if not good and source == "previous_boot" and "boot entry" in results[0][1]:
                 return {"source": source, "lines": [],
-                        "note": "There's no earlier boot in the log. Logs are kept in memory "
-                                "(and lost at reboot) unless persistent logs are turned on; "
-                                "the installer can do that."}
+                        "note": "The boot before this one wasn't saved. That's normal right "
+                                "after the first install (it was still kept in memory) and for "
+                                "any boot from before persistent logs were turned on. From the "
+                                "next reboot on, this will show the boot before it. What happened "
+                                "during this boot is under Recent activity."}
             if not good:
                 return {"source": source, "lines": [],
                         "note": "Couldn't read the system log: "
@@ -2040,7 +2042,9 @@ class LogReader:
         if len(out) > lines:
             out = out[-lines:]
         if not out and not note:
-            note = "Nothing logged yet."
+            note = ("Nothing from GhostAP was logged before the last reboot. "
+                    "What happened during this boot is under Recent activity."
+                    if source == "previous_boot" else "Nothing logged yet.")
         return {"source": source, "lines": out, "note": note}
 
 

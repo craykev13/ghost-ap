@@ -1970,7 +1970,7 @@ class LogReader:
     """Which logs the page can show. `runner(argv)` returns (exit code, text); tests swap it."""
     SOURCES = {
         "activity": "Recent activity",
-        "previous_boot": "Last boot",
+        "previous_boot": "Before the last reboot",
         "test": "Last live test",
         "snapshots": "Radio snapshots",
     }
@@ -2040,7 +2040,9 @@ class LogReader:
         if len(out) > lines:
             out = out[-lines:]
         if not out and not note:
-            note = "Nothing logged yet."
+            note = ("Nothing from GhostAP was logged before the last reboot. "
+                    "What happened during this boot is under Recent activity."
+                    if source == "previous_boot" else "Nothing logged yet.")
         return {"source": source, "lines": out, "note": note}
 
 

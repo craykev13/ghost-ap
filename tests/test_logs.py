@@ -119,6 +119,15 @@ class JournalTests(Rig):
         self.assertIn("Couldn't read the system log", r["note"])
         self.assertNotIn("hunter2", r["note"])
 
+    def test_an_empty_previous_boot_points_to_recent_activity(self):
+        self.answer = (0, "-- No entries --")
+        note = self.reader.read("previous_boot")["note"]
+        self.assertIn("before the last reboot", note)
+        self.assertIn("Recent activity", note)
+
+    def test_the_view_is_named_for_what_it_shows(self):
+        self.assertEqual(self.reader.SOURCES["previous_boot"], "Before the last reboot")
+
     def test_no_earlier_boot_gets_a_helpful_note(self):
         self.answer = (1, "No journal boot entry found from the specified boot offset (-1).")
         note = self.reader.read("previous_boot")["note"]

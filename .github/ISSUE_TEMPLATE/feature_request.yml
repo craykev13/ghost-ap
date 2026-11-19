@@ -1,0 +1,68 @@
+name: Feature request
+description: Suggest an improvement or new feature for GhostAP
+title: "[Feature]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Suggestions for improving GhostAP are welcome.
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected component
+      options:
+        - Installer
+        - Network recovery
+        - Admin page
+        - Configuration
+        - Hardware compatibility
+        - Diagnostics and logging
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or limitation
+      description: What problem would this feature solve?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed feature
+      description: Describe the functionality you would like to see.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe any existing workarounds or alternative approaches.
+
+  - type: textarea
+    id: use_case
+    attributes:
+      label: Use case
+      description: How would this feature benefit your GhostAP setup?
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional information
+      description: Include any relevant screenshots or examples.
+
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: Before submitting
+      options:
+        - label: I have checked for existing feature requests.
+          required: true
+        - label: I have removed sensitive information from this request.
+          required: true

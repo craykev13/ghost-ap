@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import pathlib
+import re
 import shutil
 import stat
 import sys
@@ -117,6 +118,46 @@ class ApplierTests(Folder):
         self.assertEqual(sorted(out), ["no", "ok"])
 
 
+class PowerRequestTests(Folder):
+    def applier(self, name="PiFi3"):
+        return ctl.Applier(self.request, self.result, hostname=lambda: name)
+
+    def test_the_pis_name_has_to_be_typed_exactly(self):
+        a = self.applier()
+        for typed in (None, "", "   ", "pifi3", "PIFI3", "PiFi", "PiFi33", "PiFi3 x", 3,
+                      ["PiFi3"], "PiFi3\n\nreboot", "yes"):
+            with self.assertRaises(ctl.ApplyRejected, msg=repr(typed)):
+                a.request("reboot", typed)
+            with self.assertRaises(ctl.ApplyRejected, msg=repr(typed)):
+                a.request("shutdown", typed)
+        self.assertFalse(self.request.exists())
+
+    def test_the_right_name_sends_the_request_with_it(self):
+        a = self.applier()
+        a.request("reboot", "PiFi3")
+        self.assertEqual(json.loads(self.request.read_text()),
+                         {"action": "reboot", "confirm": "PiFi3"})
+
+    def test_stray_spaces_around_the_name_are_forgiven_but_not_stored(self):
+        self.applier().request("shutdown", "  PiFi3 ")
+        self.assertEqual(json.loads(self.request.read_text())["confirm"], "PiFi3")
+
+    def test_a_pi_with_no_name_can_never_be_confirmed(self):
+        for typed in ("", " ", None):
+            with self.assertRaises(ctl.ApplyRejected):
+                self.applier(name="").request("reboot", typed)
+
+    def test_the_other_actions_still_need_no_name(self):
+        for action in ("test", "commit", "abort"):
+            self.request.unlink(missing_ok=True)
+            self.applier().request(action)
+            self.assertEqual(json.loads(self.request.read_text()), {"action": action})
+
+    def test_a_typed_name_alone_does_not_unlock_anything_else(self):
+        with self.assertRaises(ctl.ApplyRejected):
+            self.applier().request("recover", "PiFi3")
+
+
 class HelperTests(Folder):
     """cmd_apply_request, the root side. The real actions are swapped for recorders."""
 
@@ -197,6 +238,81 @@ class HelperTests(Folder):
         for bit in ("ZeroFi", f"http://{self.cfg.address.ip}:8480", "120", "Keep"):
             self.assertIn(bit, m)
 
+    # ---- restart and shut down ----
+    class Sh:
+        def __init__(self, outer, fail=False):
+            self.outer, self.fail, self.ran = outer, fail, []
+
+        def run(self, *cmd, check=True):
+            self.ran.append(cmd)
+            self.outer.result_when_run = self.outer.result.exists()
+            if self.fail:
+                raise ctl.GhostAPError("systemctl failed (1): Access denied")
+            return None
+
+    def ask_power(self, action, confirm="PiFi3", sh=None, state=None):
+        sh = sh or self.Sh(self)
+        self.request.write_text(json.dumps({"action": action, "confirm": confirm}))
+        with mock.patch.object(ctl.socket, "gethostname", return_value="PiFi3"), \
+                mock.patch.object(ctl, "read_state", return_value=state):
+            ctl.cmd_apply_request(self.cfg, sh)
+        return sh
+
+    def test_restart_and_shut_down_run_exactly_one_systemctl_command_each(self):
+        for action, verb in (("reboot", "reboot"), ("shutdown", "poweroff")):
+            sh = self.ask_power(action)
+            self.assertEqual(sh.ran, [("systemctl", verb)])
+            o = self.outcome()
+            self.assertEqual((o["action"], o["ok"]), (action, True))
+        self.assertEqual(self.calls, [])        # and none of the network actions ran
+
+    def test_the_result_is_written_before_the_machine_goes_down(self):
+        self.result_when_run = None
+        self.ask_power("reboot")
+        self.assertTrue(self.result_when_run)
+
+    def test_the_request_is_deleted_before_the_power_command(self):
+        self.ask_power("shutdown")
+        self.assertFalse(self.request.exists())
+
+    def test_the_messages_say_what_happens_next(self):
+        self.ask_power("reboot")
+        self.assertIn("reload", self.outcome()["message"])
+        self.ask_power("shutdown")
+        self.assertIn("powered on again", self.outcome()["message"])
+
+    def test_without_the_right_name_the_root_side_does_nothing_even_if_asked(self):
+        for confirm in (None, "", "pifi3", "other", 3, ["PiFi3"]):
+            sh = self.ask_power("reboot", confirm=confirm)
+            self.assertEqual(sh.ran, [], repr(confirm))
+            self.assertFalse(self.outcome()["ok"], repr(confirm))
+            self.assertIn("didn't match", self.outcome()["message"])
+
+    def test_a_request_with_no_confirm_field_at_all_does_nothing(self):
+        self.request.write_text('{"action": "shutdown"}')
+        sh = self.Sh(self)
+        with mock.patch.object(ctl.socket, "gethostname", return_value="PiFi3"):
+            ctl.cmd_apply_request(self.cfg, sh)
+        self.assertEqual(sh.ran, [])
+
+    def test_it_refuses_while_a_live_test_is_waiting_to_be_kept(self):
+        sh = self.ask_power("reboot", state={"purpose": "test", "committed": False})
+        self.assertEqual(sh.ran, [])
+        self.assertIn("test is running", self.outcome()["message"])
+        sh = self.ask_power("shutdown", state={"purpose": "test"})
+        self.assertEqual(sh.ran, [])
+
+    def test_a_kept_test_or_a_boot_ap_does_not_block_it(self):
+        for state in ({"purpose": "test", "committed": True}, {"purpose": "boot"}, None):
+            self.assertEqual(self.ask_power("reboot", state=state).ran, [("systemctl", "reboot")])
+
+    def test_if_the_power_command_fails_the_page_is_told(self):
+        sh = self.ask_power("reboot", sh=self.Sh(self, fail=True))
+        o = self.outcome()
+        self.assertFalse(o["ok"])
+        self.assertIn("Couldn't reboot", o["message"])
+        self.assertFalse(self.request.exists())
+
     def test_the_command_exists_needs_the_real_password_and_is_not_read_only(self):
         self.assertIs(ctl.COMMANDS["apply-request"], ctl.cmd_apply_request)
         self.assertNotIn("apply-request", ctl.READ_ONLY)
@@ -215,12 +331,13 @@ class FakeApplier:
     Rejected = ctl.ApplyRejected
 
     def __init__(self):
-        self.asked, self.raises = [], None
+        self.asked, self.confirms, self.raises = [], [], None
 
-    def request(self, action):
+    def request(self, action, confirm=None):
         if self.raises:
             raise self.raises
         self.asked.append(action)
+        self.confirms.append(confirm)
 
 
 PASSWORD = "correct horse battery"
@@ -261,6 +378,16 @@ class RouteTests(unittest.TestCase):
         s, _, b = self.req("POST", "/api/apply", {"action": "test"})
         self.assertEqual((s, b), (200, {"ok": True}))
         self.assertEqual(self.applier.asked, ["test"])
+
+    def test_the_typed_name_is_passed_on(self):
+        st, _, body = self.req("POST", "/api/apply", {"action": "reboot", "confirm": "PiFi3"})
+        self.assertEqual((st, body), (200, {"ok": True}))
+        self.assertEqual((self.applier.asked, self.applier.confirms), (["reboot"], ["PiFi3"]))
+
+    def test_a_wrong_name_is_a_400_with_the_reason(self):
+        self.applier.raises = ctl.ApplyRejected("Type this Pi's name exactly to confirm.")
+        st, _, body = self.req("POST", "/api/apply", {"action": "shutdown", "confirm": "x"})
+        self.assertEqual((st, body), (400, {"error": "Type this Pi's name exactly to confirm."}))
 
     def test_signed_out_it_cannot(self):
         s, _, _ = self.req("POST", "/api/apply", {"action": "test"}, cookie=None)
@@ -306,12 +433,27 @@ class RouteTests(unittest.TestCase):
 
 
 class PageTests(unittest.TestCase):
-    def test_the_page_only_ever_asks_for_the_three_known_actions(self):
-        import re
-        js = (ROOT / "ghostap" / "web" / "app.js").read_text()
-        asked = set(re.findall(r'sendApply\("(\w+)"\)', js))
-        asked |= set(re.findall(r'\["[^"]+", "(\w+)", "(?:primary|secondary)"\]', js))
+    js = (ROOT / "ghostap" / "web" / "app.js").read_text()
+
+    def test_the_page_only_ever_asks_for_the_known_actions(self):
+        asked = set(re.findall(r'sendApply\("(\w+)"\)', self.js))
+        asked |= set(re.findall(r'\["[^"]+", "(\w+)", "(?:primary|secondary)"\]', self.js))
+        asked |= set(re.findall(r'\{ action: "(\w+)", title:', self.js))
         self.assertEqual(asked, set(ctl.APPLY_ACTIONS))
+
+    def test_restart_and_shut_down_are_only_sent_with_the_typed_name(self):
+        # the one place that sends them takes the typed text, and only fires on an exact match
+        self.assertEqual(re.findall(r'sendPower\(', self.js).__len__(), 2)   # definition + one call
+        self.assertIn("input.value.trim() === s.hostname", self.js)
+        self.assertIn("go.disabled = input.value.trim() !== s.hostname", self.js)
+        self.assertNotRegex(self.js, r'sendApply\("(reboot|shutdown)"')
+
+    def test_pressing_enter_in_the_confirmation_box_cannot_submit_the_settings_form(self):
+        self.assertIn('e.key === "Enter") e.preventDefault()', self.js)
+
+    def test_phone_keyboards_do_not_mangle_the_typed_name(self):
+        for attr in ('"autocapitalize", "none"', '"autocorrect", "off"', '"spellcheck", "false"'):
+            self.assertIn(attr, self.js)
 
 
 class UnitFileTests(unittest.TestCase):

@@ -345,7 +345,7 @@ def make_handler(app: App):
                 if data is None:
                     return None
                 try:
-                    app.applier.request(data.get("action"))
+                    app.applier.request(data.get("action"), data.get("confirm"))
                 except app.applier.Rejected as e:
                     return self._error(400, str(e))
                 except Exception:

@@ -153,3 +153,15 @@ details.fold > .group { padding: 0 20px 18px; }
   button.ghost { padding: 7px 12px; }
   .main { padding: 16px 14px 40px; }
 }
+
+/* danger zone */
+.card.danger { border: 1px solid var(--bad); display: grid; gap: 14px; }
+.card.danger h3 { color: var(--bad); }
+.danger-row { display: grid; gap: 8px; padding-top: 12px; border-top: 1px solid var(--line); }
+.danger-row:first-of-type { border-top: 0; padding-top: 0; }
+.danger-row strong { font-size: 15px; }
+.danger-confirm { display: grid; gap: 8px; padding: 12px; border-radius: 8px; background: var(--bad-bg); }
+.danger-confirm code { font-weight: 700; word-break: break-all; }
+button.danger-outline { background: var(--card); color: var(--bad); border: 1px solid var(--bad); justify-self: start; }
+button.danger { background: var(--bad); color: #fff; font-weight: 600; }
+button.danger:disabled { opacity: .45; cursor: default; }

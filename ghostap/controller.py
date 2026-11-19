@@ -1834,15 +1834,18 @@ def cmd_test_abort(cfg: Config, sh: Shell) -> int:
 #
 # The page runs sandboxed and can't touch the network, on purpose. So it can't run
 # `ghostap test` itself. Instead it drops a tiny request file; systemd (watching for
-# that file) starts `ghostap apply-request` as root, which does ONE of three fixed
-# things and writes down how it went. The page can ask for nothing else.
+# that file) starts `ghostap apply-request` as root, which does ONE of a few fixed
+# things (try, keep, revert, restart, shut down) and writes down how it went. Restart and
+# shut down only happen if the request also carries this Pi's name, typed by the person.
+# The page can ask for nothing else.
 # --------------------------------------------------------------------------
 
 APPLY_DIR = Path("/run/ghostap-gui")                  # the page's own writable folder
 APPLY_REQUEST = APPLY_DIR / "request"
 APPLY_RESULT = RUN_DIR / "apply-result"
 APPLY_PATH_UNIT = "ghostap-apply.path"
-APPLY_ACTIONS = ("test", "commit", "abort")
+POWER_ACTIONS = {"reboot": "reboot", "shutdown": "poweroff"}   # action -> systemctl verb
+APPLY_ACTIONS = ("test", "commit", "abort") + tuple(POWER_ACTIONS)
 
 
 class ApplyRejected(GhostAPError):
@@ -1853,9 +1856,11 @@ class Applier:
     """The page's side: asks for an action and reads how the last one went."""
     Rejected = ApplyRejected
 
-    def __init__(self, request: Path | None = None, result: Path | None = None):
+    def __init__(self, request: Path | None = None, result: Path | None = None,
+                 hostname=None):
         self.request_file = Path(request or APPLY_REQUEST)
         self.result_file = Path(result or APPLY_RESULT)
+        self._hostname = hostname or socket.gethostname
         self._lock = threading.Lock()
 
     def pending(self) -> bool:
@@ -1870,15 +1875,20 @@ class Applier:
             return None
         return {k: data.get(k) for k in ("action", "ok", "message", "at")}
 
-    def request(self, action) -> None:
+    def request(self, action, confirm=None) -> None:
         if action not in APPLY_ACTIONS:
             raise ApplyRejected("unknown action")
+        body = {"action": action}
+        if action in POWER_ACTIONS:
+            if not _name_matches(confirm, self._hostname()):
+                raise ApplyRejected("Type this Pi's name exactly to confirm.")
+            body["confirm"] = confirm.strip()
         with self._lock:
             if self.pending():
                 raise ApplyRejected("Still working on the last request. Give it a moment.")
             tmp = self.request_file.with_name(self.request_file.name + ".new")
             try:
-                tmp.write_text(json.dumps({"action": action}))
+                tmp.write_text(json.dumps(body))
                 os.replace(tmp, self.request_file)
             except OSError as e:
                 with contextlib.suppress(OSError):
@@ -1886,7 +1896,42 @@ class Applier:
                 raise ApplyRejected(f"couldn't send the request: {e}")
 
 
-def _apply_message(action: str, cfg: Config) -> str:
+def _name_matches(typed, name: str) -> bool:
+    """The typed confirmation has to be this Pi's name, exactly (the way GitHub asks you to
+    type a repository's name). It also tells apart several Pis you might have open."""
+    return isinstance(typed, str) and bool(name) and typed.strip() == name
+
+
+def _apply_power(sh: Shell, action: str, confirm) -> int:
+    """Restart or shut down. Checked here as well as on the page, because this side runs as
+    root and must not rely on the other side having been polite."""
+    if not _name_matches(confirm, socket.gethostname()):
+        _write_apply_result(action, False,
+                            "The name typed didn't match this Pi's name, so nothing was done.")
+        return 0
+    state = read_state()
+    if state and state.get("purpose") == "test" and state.get("committed") is not True:
+        _write_apply_result(action, False,
+                            "A test is running. Keep or revert it first, then try again.")
+        return 0
+    log.warning("admin page asked to %s the Pi", action)
+    # Written first: the machine may be gone before anything could be written afterwards.
+    _write_apply_result(action, True, _apply_message(action, None))
+    try:
+        sh.run("systemctl", POWER_ACTIONS[action])
+    except GhostAPError as e:
+        log.error("%s", e)
+        _write_apply_result(action, False, f"Couldn't {action}: {e}")
+    return 0
+
+
+def _apply_message(action: str, cfg: Config | None) -> str:
+    if action == "reboot":
+        return ("Restarting now. The Pi is unreachable for a minute or two; "
+                "then reload this page.")
+    if action == "shutdown":
+        return ("Shutting down now. The Pi stays off until it is powered on again "
+                "(unplug and replug the power, or use its button).")
     if action == "test":
         return (f"Trying the saved settings. Join '{cfg.ssid}', open "
                 f"http://{cfg.address.ip}:{cfg.gui_port} and tap Keep within "
@@ -1911,13 +1956,16 @@ def cmd_apply_request(cfg: Config, sh: Shell) -> int:
         raise GhostAPError(f"can't read the request: {e}")
     APPLY_REQUEST.unlink(missing_ok=True)       # first, so a failure can't make it loop
     try:
-        action = json.loads(raw).get("action")
+        asked = json.loads(raw)
+        action = asked.get("action")
     except (ValueError, AttributeError):
-        action = None
+        asked, action = None, None
     if action not in APPLY_ACTIONS:
         log.warning("ignoring a request that isn't one of %s", ", ".join(APPLY_ACTIONS))
         _write_apply_result(None, False, "That request wasn't understood.")
         return 0
+    if action in POWER_ACTIONS:
+        return _apply_power(sh, action, asked.get("confirm"))
     fn = {"test": cmd_test_start, "commit": cmd_test_commit, "abort": cmd_test_abort}[action]
     log.info("admin page asked for: %s", action)
     try:

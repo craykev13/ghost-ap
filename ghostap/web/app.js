@@ -174,6 +174,7 @@ async function refresh() {
     lastStatus = r.data;
     render(r.data);
     renderApply();
+    renderDanger();
   } catch (e) {
     failures += 1;
     if (failures >= 2) {
@@ -281,6 +282,90 @@ function renderApply() {
     box.appendChild(row);
   }
   if (applyMsg) box.appendChild(el("p", "form-msg " + applyMsg.cls, applyMsg.text));
+}
+
+// ---- danger zone: restart / shut down ----
+const POWER = [
+  { action: "reboot", title: "Restart this Pi", button: "Restart...", go: "Restart",
+    text: "Reboots it now. It is unreachable for a minute or two, then rejoins its WiFi (or "
+      + "raises its own network if it can't find it).",
+    sent: "Restarting now. This page will stop responding. Give it a minute or two, then reload it." },
+  { action: "shutdown", title: "Shut down this Pi", button: "Shut down...", go: "Shut down",
+    text: "Powers it off completely. It stays off until you unplug and replug the power (or "
+      + "press its button). You can't turn it back on from this page.",
+    sent: "Shutting down now. The Pi stays off until it is powered on again." },
+];
+let powerPick = null;       // which action is waiting for its confirmation
+let powerMsg = null;        // { text, cls }
+
+async function sendPower(action, typed) {
+  powerMsg = { text: "Sending...", cls: "" };
+  renderDanger();
+  try {
+    const r = await api("/api/apply", { action, confirm: typed });
+    if (r.status === 401) { show("login"); return; }
+    if (!r.ok) {
+      powerMsg = { text: (r.data && r.data.error) || "Couldn't send that.", cls: "bad" };
+    } else {
+      powerMsg = { text: POWER.find((p) => p.action === action).sent, cls: "ok" };
+      powerPick = null;
+    }
+  } catch (e) {
+    powerMsg = { text: "Lost contact with the Pi. If it is restarting or off, that is expected.", cls: "ok" };
+    powerPick = null;
+  }
+  renderDanger();
+}
+
+function renderDanger() {
+  const box = $("danger-card");
+  box.replaceChildren();
+  box.appendChild(el("h3", null, "Danger zone"));
+  const s = lastStatus;
+  const say = (text) => box.appendChild(el("p", "muted", text));
+  if (!s || !s.apply) { say("Loading..."); return; }
+  if (!s.apply.available) {
+    say("Restart and shut down need the small helper that isn't installed yet. "
+      + "Run sudo python3 install.py again in the ghost-ap folder.");
+    return;
+  }
+  if (s.live_test) { say("Not available while a test is running. Keep or revert it first."); return; }
+  if (s.apply.pending && !powerMsg) { say("A request is already being carried out..."); return; }
+  POWER.forEach((p) => {
+    const row = el("div", "danger-row");
+    row.appendChild(el("strong", null, p.title));
+    row.appendChild(el("p", "muted", p.text));
+    if (powerPick !== p.action) {
+      const b = el("button", "danger-outline", p.button);
+      b.type = "button"; b.disabled = powerPick !== null || !!(powerMsg && powerMsg.cls === "ok");
+      b.addEventListener("click", () => { powerPick = p.action; powerMsg = null; renderDanger(); });
+      row.appendChild(b);
+    } else {
+      const conf = el("div", "danger-confirm");
+      const lead = el("p", null, "To confirm, type the Pi's name: ");
+      lead.appendChild(el("code", null, s.hostname));
+      conf.appendChild(lead);
+      const input = el("input"); input.type = "text";
+      input.setAttribute("autocomplete", "off");
+      input.setAttribute("autocapitalize", "none");
+      input.setAttribute("autocorrect", "off");
+      input.setAttribute("spellcheck", "false");
+      input.setAttribute("aria-label", "Type the Pi's name to confirm");
+      // Enter must not submit the Settings form this card sits inside
+      input.addEventListener("keydown", (e) => { if (e.key === "Enter") e.preventDefault(); });
+      const actions = el("div", "actions");
+      const go = el("button", "danger", p.go + " " + s.hostname); go.type = "button"; go.disabled = true;
+      const no = el("button", "secondary", "Cancel"); no.type = "button";
+      input.addEventListener("input", () => { go.disabled = input.value.trim() !== s.hostname; });
+      go.addEventListener("click", () => { if (input.value.trim() === s.hostname) sendPower(p.action, input.value.trim()); });
+      no.addEventListener("click", () => { powerPick = null; renderDanger(); });
+      actions.appendChild(go); actions.appendChild(no);
+      conf.appendChild(input); conf.appendChild(actions);
+      row.appendChild(conf);
+    }
+    box.appendChild(row);
+  });
+  if (powerMsg) box.appendChild(el("p", "form-msg " + powerMsg.cls, powerMsg.text));
 }
 
 // ---- settings ----

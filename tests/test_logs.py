@@ -131,8 +131,9 @@ class JournalTests(Rig):
     def test_no_earlier_boot_gets_a_helpful_note(self):
         self.answer = (1, "No journal boot entry found from the specified boot offset (-1).")
         note = self.reader.read("previous_boot")["note"]
-        self.assertIn("no earlier boot", note.lower())
-        self.assertIn("persistent", note)
+        self.assertIn("wasn't saved", note)
+        self.assertIn("Recent activity", note)
+        self.assertIn("next reboot", note)
 
     def test_journal_marker_lines_are_dropped(self):
         self.answers = [(0, "-- Boot abc --\n2026-11-17T14:00:01-0600 h x: real\n-- No entries --"),

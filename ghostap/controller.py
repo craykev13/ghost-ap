@@ -2014,9 +2014,11 @@ class LogReader:
             good = [text for rc, text in results if rc == 0]
             if not good and source == "previous_boot" and "boot entry" in results[0][1]:
                 return {"source": source, "lines": [],
-                        "note": "There's no earlier boot in the log. Logs are kept in memory "
-                                "(and lost at reboot) unless persistent logs are turned on; "
-                                "the installer can do that."}
+                        "note": "The boot before this one wasn't saved. That's normal right "
+                                "after the first install (it was still kept in memory) and for "
+                                "any boot from before persistent logs were turned on. From the "
+                                "next reboot on, this will show the boot before it. What happened "
+                                "during this boot is under Recent activity."}
             if not good:
                 return {"source": source, "lines": [],
                         "note": "Couldn't read the system log: "

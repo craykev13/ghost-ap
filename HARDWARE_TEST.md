@@ -15,7 +15,7 @@ of these at once. Stage E and later use the installed setup (`sudo python3 insta
 
 | Board | OS | Result |
 | --- | --- | --- |
-| Pi Zero W | Raspberry Pi OS 13 (Trixie) | A to E, F1 to F6 |
+| Pi Zero W | Raspberry Pi OS 13 (Trixie) | A to E, F1 to F7 |
 | Pi 3B+ | Raspberry Pi OS Lite, 64-bit | Fresh install from the installer; E1 and E2 (boot fallback, failover, rejoin); the admin page, F6 (logs) and F7 (link check) |
 
 Pi 4 and Pi 5 are expected to work but have not been run through this list yet.

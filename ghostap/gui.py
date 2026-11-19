@@ -351,7 +351,8 @@ def make_handler(app: App):
                 except Exception:
                     log.exception("apply request failed")
                     return self._error(500, "couldn't send the request")
-                log.info("admin page asked to %s", data.get("action"))
+                # Only a known action gets this far, but never put request text in a log raw.
+                log.info("admin page asked to %s", _one_line(data.get("action")))
                 return self._json(200, {"ok": True})
             if path not in ("/api/login", "/api/logout"):
                 return self._error(404, "not found")
@@ -383,6 +384,11 @@ def make_handler(app: App):
         do_PUT = do_DELETE = do_PATCH = do_HEAD = do_OPTIONS = _no
 
     return Handler
+
+
+def _one_line(value) -> str:
+    """Text from a request, made safe to log: no line breaks, and not absurdly long."""
+    return str(value).replace("\r", " ").replace("\n", " ")[:40]
 
 
 def make_server(provider, password_hash: str, host: str, port: int,

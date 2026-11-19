@@ -227,9 +227,9 @@ class HelperTests(Folder):
         self.assertEqual(self.calls, [])
         self.assertFalse(self.result.exists())
 
-    def test_the_result_is_readable_by_the_page(self):
+    def test_the_result_is_private_to_root_which_is_who_reads_it(self):
         self.ask('{"action": "abort"}')
-        self.assertEqual(stat.S_IMODE(self.result.stat().st_mode), 0o644)
+        self.assertEqual(stat.S_IMODE(self.result.stat().st_mode), 0o600)
         self.assertIsInstance(self.outcome()["at"], int)
 
     def test_after_a_test_starts_the_message_says_how_to_get_back_in(self):
@@ -388,6 +388,14 @@ class RouteTests(unittest.TestCase):
         self.applier.raises = ctl.ApplyRejected("Type this Pi's name exactly to confirm.")
         st, _, body = self.req("POST", "/api/apply", {"action": "shutdown", "confirm": "x"})
         self.assertEqual((st, body), (400, {"error": "Type this Pi's name exactly to confirm."}))
+
+    def test_request_text_cannot_forge_log_lines(self):
+        logging.disable(logging.NOTSET)
+        self.addCleanup(logging.disable, logging.CRITICAL)
+        with self.assertLogs(gui.log, level="INFO") as cm:
+            self.req("POST", "/api/apply", {"action": "test\nINFO forged: line"})
+        for rec in cm.records:
+            self.assertNotIn("\n", rec.getMessage())
 
     def test_signed_out_it_cannot(self):
         s, _, _ = self.req("POST", "/api/apply", {"action": "test"}, cookie=None)

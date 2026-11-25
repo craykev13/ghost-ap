@@ -58,9 +58,13 @@ loads nothing from outside. It has three tabs:
 open the page there and tap **Keep**, it undoes itself. The admin password and the page's own
 port and address are changed over SSH, not from the page.
 
+At the bottom of Settings, a red **Danger zone** can **restart** or **shut down** the Pi. Each
+asks you to type the Pi's name first (as GitHub does for a repository), and neither is offered
+while a test is waiting to be kept. A shut down leaves the Pi off until its power is cycled.
+
 The page itself has no network powers. It leaves a small request file, and a separate
-root-owned helper (`ghostap-apply`, installed by `install.py`) carries out one of exactly three
-things: try, keep or revert.
+root-owned helper (`ghostap-apply`, installed by `install.py`) carries out one of a few fixed
+things: try, keep, revert, restart or shut down.
 
 The installer offers the page: answer yes, pick (or generate) an admin password, and it installs
 and enables the page, then prints the address when it finishes. Unattended, use
@@ -99,6 +103,12 @@ yet; `ghostap preflight` says so instead of guessing.
 - [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md): can't see the network, logs, `ghostap preflight`
 - [`HARDWARE_TEST.md`](HARDWARE_TEST.md): hardware test checklist, and which boards have passed it
 - [`ghostap.toml.example`](ghostap.toml.example): every setting, generated from the code
+- [`CONTRIBUTING.md`](CONTRIBUTING.md): bug reports, hardware compatibility reports, changes
+- [`SECURITY.md`](SECURITY.md): reporting a vulnerability (privately, please)
+
+## License
+
+GNU GPL v3. See [`LICENSE`](LICENSE).
 
 ## Status
 

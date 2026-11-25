@@ -15,7 +15,7 @@ of these at once. Stage E and later use the installed setup (`sudo python3 insta
 
 | Board | OS | Result |
 | --- | --- | --- |
-| Pi Zero W | Raspberry Pi OS 13 (Trixie) | A to E, F1 to F7 |
+| Pi Zero W | Raspberry Pi OS 13 (Trixie) | A to E, F1 to F7; failover AP re-checked after a full `apt upgrade` (kernel 6.18.60, new WiFi firmware) |
 | Pi 3B+ | Raspberry Pi OS Lite, 64-bit | Fresh install from the installer; E1 and E2 (boot fallback, failover, rejoin); the admin page, F6 (logs) and F7 (link check) |
 
 Pi 4 and Pi 5 are expected to work but have not been run through this list yet.
@@ -93,7 +93,8 @@ nmcli device status
 pgrep -a 'hostapd|dnsmasq'
 ```
 
-and include it, with the board and OS, in the issue. The admin page's **Logs** tab shows most of
+and include it, with the board and OS, in the issue (there are templates for bug reports and
+hardware compatibility reports). The admin page's **Logs** tab shows most of
 this from a browser, and **Copy** puts it on the clipboard.
 
 ## E. Boot fallback and failover
@@ -178,6 +179,19 @@ cannot cover.
 reboot Recent activity has a `link check:` line. If the card says "couldn't check if it answers",
 the page's sandbox is not allowed to run `ping`; the command-line and boot-log checks still work.
 Switch the known WiFi off and on again to see the line change (it can lag by about 15 s).
+
+**F8. Danger zone.** Needs the apply helper (F1). At the bottom of the Settings tab:
+- Press **Restart...**: the button for the confirmation stays greyed out until the Pi's name is typed
+  exactly (capitals count; a wrong or partial name does nothing). **Cancel** closes it.
+- Type the name, confirm: the page says it is restarting, the Pi goes quiet, then comes back
+  and the page works again after a minute or two (`journalctl -b -1 | grep "asked to reboot"`).
+- With a test waiting (F3, before Keep or Revert), both buttons are replaced by a note.
+- **Shut down...** works the same way but leaves the Pi off until power is cycled, so try it only
+  with the Pi within reach.
+
+**After a kernel or firmware update.** `sudo apt full-upgrade` can change the WiFi firmware. After
+one, repeat E2 (switch the known WiFi off and confirm the fallback network appears) before relying
+on the Pi unattended.
 
 ## Not covered yet
 
